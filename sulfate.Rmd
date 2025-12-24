@@ -864,7 +864,17 @@ for (rec in each_injection) {
   cat('</div>\n')
   
   if (!is.null(rec$largest_peaks) && nrow(rec$largest_peaks) > 0) {
+ 
+    for (i in seq_along(each_injection)) {
+  rec <- each_injection[[i]]   
+    # Save largest peak intensity back into analyses ----
+if (!is.null(rec$largest_peaks) && nrow(rec$largest_peaks) > 0) {
+    # extract first peak intensity
+    first_intensity <- rec$largest_peaks$peak_intensity[1]
 
+    # save into the SAME row of analyses
+    ruby_data_summary$first_peak_intensity[i] <- first_intensity
+  }}
     cat('<div class="section-indent">Twenty largest peaks: <table style="border-collapse:collapse; margin-top:1rem;">\n')
     cat('<tr>',
         '<th style="border:1px solid #ccc; padding:4px;">Mean m/z</th>',
@@ -899,7 +909,6 @@ ruby_data_summary <- ruby_data_summary %>%
     R17O = R17Omean
   )
 
-
 ```
 
 Analyzer temperature is stored in the .raw data files. While we still dont know where exactly in the instrument this measurement originates, it does track with lab temperature. Furthermore, it also seems to explain much of the ratio variability. This Ruby-only version of the code does not yet have a way to flag temperature variability data like previous Stella vs Ruby scripts did.
@@ -931,21 +940,23 @@ analyses <- analyses %>%
 analyses <- analyses %>%
   left_join(
     bracketing_references %>%
-      select(sample_order, analyzerTmean, TICmean) %>%
-      rename(nearest_ref_before = sample_order, mean_temp_before = analyzerTmean, TIC_before = TICmean),
+      select(sample_order, analyzerTmean, TICmean, OICmean, first_peak_intensity) %>%
+      rename(nearest_ref_before = sample_order, mean_temp_before = analyzerTmean, TIC_before = TICmean, OIC_before = OICmean, mpi_before = first_peak_intensity),
     by = "nearest_ref_before"
   ) %>%
   left_join(
     bracketing_references %>%
-      select(sample_order, analyzerTmean, TICmean) %>%
-      rename(nearest_ref_after = sample_order, mean_temp_after = analyzerTmean, TIC_after = TICmean),
+      select(sample_order, analyzerTmean, TICmean, OICmean, first_peak_intensity) %>%
+      rename(nearest_ref_after = sample_order, mean_temp_after = analyzerTmean, TIC_after = TICmean, OIC_after = OICmean, mpi_after = first_peak_intensity),
     by = "nearest_ref_after"
   ) %>%
   mutate(
     diff_temp_before = abs(analyzerTmean - mean_temp_before),
     diff_temp_after = abs(analyzerTmean - mean_temp_after),
     diff_TIC = ((TICmean-TIC_before)+(TICmean-TIC_after))/2,
-    ratio_TIC = TICmean/((TIC_before+TIC_after)/2)
+    ratio_TIC = TICmean/((TIC_before+TIC_after)/2),
+    ratio_OIC = OICmean/((OIC_before+OIC_after)/2),
+    ratio_mpi = first_peak_intensity/((mpi_before + mpi_after)/2)
   )
 
 message('\n ---------- wM0 - join to get R34S, R33S, R18O, and R17O for nearest before and after ----------')
@@ -1101,6 +1112,8 @@ run_summary <- analyses %>%
     sd_tic_diff = sd(diff_TIC, na.rm=TRUE),
     mean_tic_ratio = mean(ratio_TIC, na.rm=TRUE),
     sd_tic_ratio = sd(ratio_TIC, na.rm=TRUE),
+    mean_oic_ratio = mean(ratio_OIC, na.rm=TRUE),
+    sd_oic_ratio = sd(ratio_OIC, na.rm=TRUE),
     .groups = "drop"
   ) %>%
   mutate(
@@ -1449,9 +1462,13 @@ Fig_tic_vs_concentration <- ggplot(run_summary_concentration, aes(x=concentratio
                                     labs(x = "Sample Concentration (uM)", y = "TIC", color = "Sample Name") +
                                     theme_minimal()
 print(Fig_tic_vs_concentration)
+
 } else {
   print('No concentration range analyses')
 }
+write.csv(analyses, file = paste0(RUN_DIRECTORY,"__raw_byInjection.csv"), row.names = FALSE)
+
+write.csv(bracketing_references, file = paste0(RUN_DIRECTORY,"__bracketing.csv"), row.names = FALSE)
 
 ```
 
@@ -1470,6 +1487,73 @@ Fig_d34Sresidual_vs_order <- ggplot() +
       labs(title = d34S_title, x = "Sample Order", y = "d34S residual (permil)", color = "Sample Name") +
       theme_minimal()
 print(Fig_d34Sresidual_vs_order)
+
+# Ensure sample_name is a factor
+residuals$sample_name <- factor(residuals$sample_name)
+
+# Compute mean ± SD for each sample
+sd_data <- residuals %>%
+  group_by(sample_name) %>%
+  summarise(
+    mean_residual = mean(d34S_residual, na.rm = TRUE),
+    sd_residual   = sd(d34S_residual, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    ymin = mean_residual - sd_residual,
+    ymax = mean_residual + sd_residual
+  )
+
+# Merge SD info into main data + flag outliers
+residuals_flagged <- residuals %>%
+  left_join(sd_data, by = "sample_name") %>%
+  mutate(
+    outside_sd = d34S_residual < ymin | d34S_residual > ymax,
+    label_font = ifelse(outside_sd, "bold", "plain")
+  )
+
+Fig_d34Sresidual_vs_name <- ggplot() +
+  
+  # ---- SD shaded region ----
+  geom_rect(
+    data = sd_data,
+    aes(
+      xmin = as.numeric(sample_name) - 0.45,
+      xmax = as.numeric(sample_name) + 0.45,
+      ymin = ymin,
+      ymax = ymax,
+      fill = sample_name
+    ),
+    alpha = 0.25
+  ) +
+  
+  # ---- Points ----
+  geom_point(
+    data = residuals_flagged,
+    aes(x = sample_name, y = d34S_residual, color = sample_name),
+    size = 6
+  ) +
+  
+  # ---- Text labels (bold if outside SD band) ----
+  geom_text(
+    data = residuals_flagged,
+    aes(
+      x = sample_name,
+      y = d34S_residual,
+      label = sample_order
+    )
+  ) +
+
+  labs(
+    title = "1-Sigma range highlighted. Points outside that range are bold",
+    x = "Sample Name",
+    y = "d34S residual (permil)",
+    color = "Sample Name",
+    fill = "Sample Name"
+  ) +
+  theme_minimal()
+
+print(Fig_d34Sresidual_vs_name)
 
 Fig_d34Sresidual_vs_TIC <- ggplot() + 
       geom_point(data=residuals, mapping=aes(x=TICmean, y=d34S_residual, color=sample_name), size=6) +
