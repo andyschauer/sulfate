@@ -1,0 +1,1363 @@
+---
+title: "`r basename(getwd())`"
+author: "Becky Alexander, Andy Schauer, Ursula Jongebloed, Drew Pronovost, Alli Moon, ..."
+date: "prepared on `r Sys.Date()`"
+output:
+  html_document:
+    keep_md: true
+    df_print: paged
+    number_sections: false
+    toc: false
+---
+
+```{css Style, echo=FALSE}
+h1.title { font-siz
+e: 16px; text-align: right; }
+h4.author { font-size: 12px; text-align: right; }
+h4.date { font-size: 12px; text-align: right; }
+
+div.main-container {
+  max-width: 1200px !important;  /* widen document */
+  margin-left: auto;
+  margin-right: auto;
+  padding-left: 20px;   /* optional: add some breathing room */
+  padding-right: 20px;
+}
+
+.clearboth{ clear:both;}
+.thumbnail{float:left;}
+.list{float:left; width:30rem;}
+.main_list_figures{ float:right;}
+.section-indent{margin-left:2rem;}
+.expandable_subtitles{font-size: 24px; color: blue; text-decoration: underline;}
+.high_res_sample{font-size: 12px;}
+
+
+table{
+  width: auto !important;
+  border-collapse: collapse;
+	margin:0.5rem;
+	padding:0.5rem;
+}
+table tr:hover {
+	background-color: #ffff99;
+}
+table caption{
+	text-align:left;
+	margin-bottom:1rem;
+}
+table th{
+	border-bottom:1px solid black;
+}
+table td{
+	text-align:center;
+	padding:1.0rem;
+	padding-right:2.0rem;
+}
+
+```
+
+```{r Initialization, echo=FALSE, include=FALSE}
+# -------------------- THINGS YOU MAY WANT TO CHANGE RUN-TO-RUN --------------------
+
+DATA_DIRECTORY <- "/home/disk/melvin/OrbiData/Ruby"
+RUN_DIRECTORY <- basename(getwd())
+RAW_DIRECTORY <- "wM0"
+ISOX_DIRECTORY <- "wM0"
+ISOX_FILENAME <- "combined.isox"
+
+ISOTOPOCULES <- c("M0"=96.96010,
+                  "33S"=97.95949,
+                  "17O"=97.96432,
+                  "34S"=98.95590,
+                  "18O"=98.96435)
+
+REFERENCE_MATERIALS_FILE <- "/home/disk/melvin/OrbiData/reference_materials/reference_materials.json"
+
+SAMPLES_TO_IGNORE <- c()          # if a particular sample is bad, enter its filename with quotes around it here, e.g. 'SodSul-2-ref_5'
+
+WEAK_ISOTOPOCULE_THRESHOLD <- 10  # filter out weak isotopocules that are present in this percentage of scans or lower, e.g. if 17O18O is present in <10% of scans, filter them all out
+
+AGC_FOLD_THRESHOLD <- 4           # if a scan has this multiple greater than or less than the average number of ions in the orbitrap, they are filtered out
+
+ABS_DELTA_T_THRESHOLD <- 0.1      # Set threshold of sample vs standard temperature difference for flagging data
+
+BRACKETING_REFERENCE <- "SodSul_2_ref"
+
+d17O_CALIBRATION_STANDARDS <- c('SodSul_8', 'S_MIF_2') 
+d18O_CALIBRATION_STANDARDS <- c('SodSul_8', 'S_MIF_2')
+d33S_CALIBRATION_STANDARDS <- c('SodSul_8', 'S_MIF_2')
+d34S_CALIBRATION_STANDARDS <- c('SodSul_8', 'S_MIF_2')
+
+PEAK_DEFINITION_STRATEGY <- 'combined'                   # options are:  'smoothed_derivative', 'trimmed_median', 'combined', 'manual'
+SAMPLE_PEAK_START <- 1.0
+SAMPLE_PEAK_END <-4.0
+
+```
+
+```{r Libraries, echo=FALSE, include=FALSE}
+library(bslib)
+library(cowplot)
+library(dplyr)
+library(fs)
+library(furrr)
+library(future)
+library(ggplot2)
+library(glue)
+library(grid)
+library(gridExtra)
+library(htmltools)
+#library(isoorbi.uw)
+library(isoorbi)
+library(jsonlite)
+library(kableExtra)
+library(plotly)
+library(progressr)
+library(purrr)
+library(ragg)
+library(tibble)
+library(tidyr)
+library(zoo)
+
+```
+
+```{r Functions, echo=FALSE, include=FALSE}
+
+extract_conc <- function(x) {
+  # TRUE for names that *end* in something like "15uM" or "22p5uM"
+  has_conc <- grepl("[0-9]+(?:p[0-9]+)?uM$", x)
+
+  # Pull out just the numeric (and p) part after the last underscore:
+  # "SodSul_4_17p5uM" -> "17p5"
+  conc_str <- ifelse(
+    has_conc,
+    sub(".*_([0-9]+(?:p[0-9]+)?)uM$", "\\1", x),
+    NA_character_
+  )
+
+  # Turn "17p5" into "17.5"
+  conc_str <- sub("p", ".", conc_str)
+
+  # Final numeric vector
+  as.numeric(conc_str)
+}
+
+
+
+process_one_injection <- function(filename, df, high_res_directory) {
+
+  df_to_be_joined <- df %>%
+    dplyr::distinct(scan.no, .keep_all = TRUE) %>%
+    dplyr::select(scan.no, sample_name, sample_order, time.min, ions.incremental, tic, it.ms, oic, analyzerTemperature)
+
+  # Step 1: identify duplicates
+  dups_summary <- df %>%
+    dplyr::summarise(n = dplyr::n(), .by = c(scan.no, isotopocule)) %>%
+    dplyr::filter(n > 1L)
+  
+  # Step 2: if any duplicates, message the user
+  if (nrow(dups_summary) > 0) {
+    message(
+      "Note: removed ", sum(dups_summary$n - 1),
+      " duplicated rows across ", nrow(dups_summary),
+      " scan.no/isotopocule combinations."
+    )
+  }
+  
+  # Step 3: drop duplicates (keep first row for each scan.no + isotopocule)
+  df_nodups <- df %>%
+    dplyr::group_by(scan.no, isotopocule) %>%
+    dplyr::slice(1L) %>%        # or dplyr::distinct(scan.no, isotopocule, .keep_all = TRUE)
+    dplyr::ungroup()
+  
+  # Your original block, now using df_nodups
+  df_wide <- df_nodups %>%
+    tidyr::pivot_wider(
+      id_cols = scan.no,
+      names_from  = isotopocule,
+      values_from = ratio,
+      names_glue  = "R{isotopocule}"
+    ) %>%
+    dplyr::left_join(df_to_be_joined, by = "scan.no")
+  
+  
+  # ------- Define Injection Peak -------
+  smoothing_window <- 20
+  kernel <- rep(1 / smoothing_window, smoothing_window)
+  tic_convolved <- stats::filter(df_wide$tic, kernel, sides = 2)
+  
+  convolve_df <- data.frame(
+    dtic = as.numeric(diff(tic_convolved)),
+    dT = diff(df_wide$time.min * 60)
+  )
+  convolve_df$dtic_dT <- convolve_df$dtic / convolve_df$dT
+  convolve_df$time_min <- df_wide$time.min[2:nrow(df_wide)]
+  
+  ruby_start_window <- which(df_wide$time.min>0 & df_wide$time.min<2)
+  ruby_start <- df_wide$time.min[ruby_start_window[which.max(convolve_df$dtic_dT[ruby_start_window])]]
+  ruby_end_window <- which(df_wide$time.min>1 & df_wide$time.min<5)
+  ruby_end <- df_wide$time.min[ruby_end_window[which.min(convolve_df$dtic_dT[ruby_end_window])]]
+  
+  ruby_start_index <- which(convolve_df$time_min==ruby_start)
+  ruby_end_index <- which(convolve_df$time_min==ruby_end)
+  trimmed_window <- which(convolve_df$dtic_dT[ruby_start_index:ruby_end_index]<5e6 & convolve_df$dtic_dT[ruby_start_index:ruby_end_index]>-5e6)
+  
+  if (PEAK_DEFINITION_STRATEGY=='smoothed_derivative'){
+    ruby_start <- min(convolve_df$time_min[ruby_start_index:ruby_end_index][trimmed_window])
+    ruby_end <- max(convolve_df$time_min[ruby_start_index:ruby_end_index][trimmed_window])
+  } else if (PEAK_DEFINITION_STRATEGY=='trimmed_median'){
+    ruby_start <- SAMPLE_PEAK_START
+    ruby_end <- SAMPLE_PEAK_END
+  } else if (PEAK_DEFINITION_STRATEGY=='combined'){
+    ruby_start <- min(convolve_df$time_min[ruby_start_index:ruby_end_index][trimmed_window])
+    ruby_end <- max(convolve_df$time_min[ruby_start_index:ruby_end_index][trimmed_window])
+  } else if (PEAK_DEFINITION_STRATEGY=='manual'){
+    ruby_start <- SAMPLE_PEAK_START
+    ruby_end <- SAMPLE_PEAK_END
+  } else {
+    message(paste0("PEAK_DEFINITION_STRATEGY was entered as ", PEAK_DEFINITION_STRATEGY, " and is not recognized. Your options are 'smoothed_derivative', 'trimmed_median', 'combined', 'manual'"))
+    knitr::knit_exit()
+  }
+    
+  df_clean <- subset(df_wide, !is.na(R34S) &
+                     (is.na(ruby_start) | time.min > ruby_start) &
+                     (is.na(ruby_end)   | time.min < ruby_end))
+  if (PEAK_DEFINITION_STRATEGY=='trimmed_median' || PEAK_DEFINITION_STRATEGY=='combined'){
+    median_tic <- median(df_clean$tic)
+    df_clean <- subset(df_clean, tic/median_tic>0.8 & tic/median_tic<1.2)
+  }
+  
+  # ----- OIC Outlier Removal -----
+  nrow_before <- nrow(df_clean)
+  mean_oic <- mean(df_clean$oic)
+  sd_oic <- sd(df_clean$oic)
+  upper_oic <- mean_oic + sd_oic*2
+  lower_oic <- mean_oic - sd_oic*2
+  df_clean <- subset(df_clean, oic>lower_oic & oic<upper_oic)
+  nrow_after <- nrow(df_clean)
+  oic_title <- paste0("OIC vs time; ",nrow_before-nrow_after, " outliers found.")
+
+  injection_summary <- df_clean %>%
+    dplyr::summarize(
+      run = !!RUN_DIRECTORY,
+      sample_name = dplyr::first(sample_name),
+      sample_order = dplyr::first(sample_order),
+      ruby_start = !!ruby_start,
+      ruby_end = !!ruby_end,
+      n = dplyr::n(),
+      TICmean = mean(tic, na.rm = TRUE),
+      TICsd = sd(tic, na.rm = TRUE),
+      OICmean = mean(oic, na.rm = TRUE),
+      OICsd = sd(oic, na.rm = TRUE),
+      analyzerTmean = mean(analyzerTemperature, na.rm = TRUE),
+      analyzerTsd = sd(analyzerTemperature, na.rm = TRUE),
+      R34Smean = mean(R34S, na.rm = TRUE),
+      R34Ssd = sd(R34S, na.rm = TRUE),
+      R33Smean = mean(R33S, na.rm = TRUE),
+      R33Ssd = sd(R33S, na.rm = TRUE),
+      R18Omean = mean(R18O, na.rm = TRUE),
+      R18Osd = sd(R18O, na.rm = TRUE),
+      R17Omean = mean(R17O, na.rm = TRUE),
+      R17Osd = sd(R17O, na.rm = TRUE)
+    ) %>%
+    tidyr::replace_na(list(
+      sample_name = unique(df_wide$sample_name)[1],
+      sample_order = unique(df_wide$sample_order)[1]
+    ))
+
+  p1 <- ggplot() +
+    geom_line(data=df_wide, aes(x = time.min, y = tic), color="black", linewidth=2) +
+    geom_line(data=df_clean, aes(x = time.min, y = tic), color="yellow", linewidth=1) +
+    geom_vline(xintercept = ruby_start, linetype = "solid", color = "green", linewidth = 1) +
+    geom_vline(xintercept = ruby_end,   linetype = "solid", color = "red",   linewidth = 1) +
+    labs(title = "TIC vs time", x = "Time (minutes)", y = "TIC") +
+    scale_x_continuous(breaks = seq(0, 10, by = 1)) +
+    theme_minimal()
+
+  p2 <- ggplot() +
+    geom_line(data=df_wide, aes(x = time.min, y = oic), color="black", linewidth=2) +
+    geom_line(data=df_clean, aes(x = time.min, y = oic), color="yellow", linewidth=1) +
+    geom_vline(xintercept = ruby_start, linetype = "solid", color = "green", linewidth = 1) +
+    geom_vline(xintercept = ruby_end,   linetype = "solid", color = "red",   linewidth = 1) +
+    labs(title = oic_title, x = "Time (minutes)", y = "OIC") +
+    scale_x_continuous(breaks = seq(0, 10, by = 1)) +
+    theme_minimal()
+
+  p3 <- ggplot(convolve_df) +
+    geom_line(aes(x = time_min, y = dtic_dT)) +
+    labs(title = "dtic_dT vs time", x = "Time (minutes)", y = "dTIC/dT") +
+    geom_vline(xintercept = ruby_start, linetype = "solid", color = "green", linewidth = 1) +
+    geom_vline(xintercept = ruby_end,   linetype = "solid", color = "red",   linewidth = 1) +
+    scale_x_continuous(breaks = seq(0, 10, by = 1)) +
+    theme_minimal()
+  
+  png1 <- fs::path(high_res_directory, sprintf('%s_fig_%d.png', filename, 1))
+  png2 <- fs::path(high_res_directory, sprintf('%s_fig_%d.png', filename, 2))
+  png3 <- fs::path(high_res_directory, sprintf('%s_fig_%d.png', filename, 3))
+  
+  ggsave(png1, p1, device = ragg::agg_png, width = 5, height = 3, units = "in", dpi = 100)
+  ggsave(png2, p2, device = ragg::agg_png, width = 5, height = 3, units = "in", dpi = 100)
+  ggsave(png3, p3, device = ragg::agg_png, width = 5, height = 3, units = "in", dpi = 100)
+
+  list(
+    filename = filename,
+    scanlimits = c(min(df_clean$scan.no), max(df_clean$scan.no)),
+    row = injection_summary,
+    images = c(png1, png2, png3)
+  )
+} # end process_one_injection
+
+
+
+process_one_raw_file <- function(raw_file, high_res_directory) {
+  filename <- tools::file_path_sans_ext(basename(raw_file))
+
+  raw_agg_file <- raw_file |>
+    orbi_read_raw(include_spectra = FALSE) |>
+    orbi_aggregate_raw()
+
+  isoraw <- orbi_get_data(
+    raw_agg_file,
+    file_info = c("filename"),
+    scans     = tidyselect::everything(),
+    peaks     = tidyselect::everything(),
+    spectra   = NULL,
+    problems  = NULL,
+    summary   = NULL,
+    by        = c("uidx", "scan.no")
+  )
+
+  isoraw <- orbi_identify_isotopocules(
+    isoraw,
+    isotopocules      = ISOTOPOCULES,
+    default_tolerance = 0.6,
+    default_charge    = 1
+  )
+  isoraw <- orbi_filter_isotopocules(isoraw, isotopocules = names(ISOTOPOCULES))
+  isoraw <- orbi_calculate_ions(isoraw, CN = 3, RN = 240000)
+
+  isoraw$sample_name  <- gsub("-", "_", sub("_.*", "", isoraw$filename))
+  isoraw$sample_order <- as.numeric(sub(".*_", "", isoraw$filename))
+  isoraw$oic          <- isoraw$tic * isoraw$it.ms / 1000
+  isoraw              <- orbi_define_basepeak(isoraw, basepeak_def = "M0")
+  isoraw              <- subset(isoraw, time.min > 0.2)
+
+  # main per-injection processing (your function)
+  res <- process_one_injection(filename, isoraw, high_res_directory)
+
+  # make M0/M1/M2 diagnostic scatter plots using res$scanlimits
+  peaks <- subset(
+    raw_agg_file$peaks,
+    (scan.no > res$scanlimits[1]) & (scan.no < res$scanlimits[2])
+  )
+
+  M0_limits <- c(96.930, 96.990)
+  M1_limits <- c(97.930, 97.990)
+  M2_limits <- c(98.930, 98.990)
+
+  plots_df <- list(
+    list(df = peaks[peaks$mzMeasured > M0_limits[1] & peaks$mzMeasured < M0_limits[2], ], ttl = "M0", lims = M0_limits, idx = 4),
+    list(df = peaks[peaks$mzMeasured > M1_limits[1] & peaks$mzMeasured < M1_limits[2], ], ttl = "M1", lims = M1_limits, idx = 5),
+    list(df = peaks[peaks$mzMeasured > M2_limits[1] & peaks$mzMeasured < M2_limits[2], ], ttl = "M2", lims = M2_limits, idx = 6)
+  )
+
+  dir_create(high_res_directory, recurse = TRUE)
+
+  extra_pngs <- purrr::map_chr(plots_df, function(x) {
+    p <- ggplot(x$df) +
+      geom_point(aes(x = mzMeasured, y = intensity)) +
+      labs(title = x$ttl, x = "mz Measured", y = "Intensity") +
+      xlim(x$lims[1], x$lims[2]) +
+      theme_minimal()
+    out <- fs::path(high_res_directory, sprintf("%s_fig_%d.png", filename, x$idx))
+    ggsave(out, p, device = ragg::agg_png, width = 5, height = 3, units = "in", dpi = 100)
+    out
+  })
+
+  
+  ppm_tol <- 3  # 5 ppm tolerance
+  
+  peaks_clustered <- peaks %>%
+    arrange(mzMeasured) %>%
+    mutate(
+      grp = cumsum(c(TRUE, diff(mzMeasured) > mzMeasured[-n()] * ppm_tol * 1e-6))
+    ) %>%
+    group_by(grp) %>%
+    summarise(
+      mean_mz = mean(mzMeasured),
+      peak_intensity = max(intensity),
+      n = n()
+    ) %>%
+    arrange(desc(peak_intensity))
+  res$largest_peaks <- head(peaks_clustered,10)
+
+  res$images <- c(res$images, extra_pngs)
+  res
+} # end process_one_raw_file
+
+
+
+
+  
+compute_ref <- function(before, after, diff_temp_before, diff_temp_after) {
+  if (!is.na(diff_temp_before) & diff_temp_before < ABS_DELTA_T_THRESHOLD & !is.na(diff_temp_after) & diff_temp_after < ABS_DELTA_T_THRESHOLD) {
+    return(mean(c(before, after), na.rm = TRUE))
+  } else if (!is.na(diff_temp_before) & diff_temp_before < ABS_DELTA_T_THRESHOLD) {
+    return(before)
+  } else if (!is.na(diff_temp_after) & diff_temp_after < ABS_DELTA_T_THRESHOLD) {
+    return(after)
+  } else {
+    return(NaN)
+  }
+}
+
+
+
+
+find_nearest <- function(sample_order, reference_orders) {
+  before <- max(reference_orders[reference_orders < sample_order], na.rm = TRUE)
+  after <- min(reference_orders[reference_orders > sample_order], na.rm = TRUE)
+  
+  # Replace Inf/-Inf with NA if no valid before or after exists
+  before <- ifelse(is.finite(before), before, NA)
+  after <- ifelse(is.finite(after), after, NA)
+  
+  return(c(before, after))
+}
+
+
+
+
+plot_temperature <- function(samples_data_frame){
+  Fig__AnalyzerT_vs_order <- ggplot() +
+  geom_errorbar(data = samples_data_frame,
+                mapping = aes(x = sample_order, 
+                              ymin = analyzerTmean - analyzerTsd*2, 
+                              ymax = analyzerTmean + analyzerTsd*2, 
+                              color = sample_name),
+                  width = 0.2,  # Controls the width of error bars
+                  linewidth = 1) +   
+  geom_point(data = samples_data_frame, 
+             mapping = aes(x = sample_order, y = analyzerTmean, color = sample_name), 
+             size = I(6)) +
+  geom_text(data = samples_data_frame,
+          mapping = aes(x = sample_order, 
+                        y = analyzerTmean,
+                        label = sample_order),
+          vjust = 0.5, hjust = 0.5, color = "black")+
+  labs(
+    title = paste0("Analyzer temperature vs sample order. Error bars are 2sd. Threshold = ", ABS_DELTA_T_THRESHOLD),
+    x = "Sample order",
+    y = "Mean Analyzer Temp (*C)") +
+  theme_minimal() +
+  theme(
+    axis.line = element_line(color = "black", linewidth = 1),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 1),
+    legend.position = "right",  # Places legend outside the plot
+    legend.text = element_text(size = 14),  # Increase legend font size
+    plot.title = element_text(size = 16, face = "bold"),  # Adjust title size
+    axis.title = element_text(size = 14),  # Adjust axis labels
+    axis.text = element_text(size = 12)  # Adjust axis text
+  )
+  print(Fig__AnalyzerT_vs_order)
+}
+
+```
+
+## Introduction
+
+Our initial code to calculate deltas from Ivan (a Thermo Exploris 240 Orbitrap Mass Spectrometer), Ruby (an HPLC), and Stella (a syringe and pump), all located in IsoLab, UW. This R Markdown grew from the R script "CalculateDeltas.R".
+
+At the top of the .Rmd file, find the THINGS YOU MAY WANT TO CHANGE RUN TO RUN for just that. The current state of those things is shown below:
+
+<details><summary class="expandable_subtitles">Data Processing Settings</summary>
+
+  **Thresholds**:
+  
+  - ABS_DELTA_T_THRESHOLD = `r ABS_DELTA_T_THRESHOLD`
+  - WEAK_ISOTOPOCULE_THRESHOLD = `r WEAK_ISOTOPOCULE_THRESHOLD`
+  - AGC_FOLD_THRESHOLD = `r AGC_FOLD_THRESHOLD`
+
+  **Chosen Calibration Standards**:
+
+  - d17O_CALIBRATION_STANDARDS = `r d17O_CALIBRATION_STANDARDS`
+  - d18O_CALIBRATION_STANDARDS = `r d18O_CALIBRATION_STANDARDS`
+  - d33S_CALIBRATION_STANDARDS = `r d33S_CALIBRATION_STANDARDS`
+  - d34S_CALIBRATION_STANDARDS = `r d34S_CALIBRATION_STANDARDS`
+
+  **Ideal Calibration Standards** - Agreed upon calibration standards as of 2025-05-22:
+
+| Purpose     | d34S        | d17O & d18O |
+| ----------- | ----------- | ----------- |
+| calibration | S_MIF_2     | SodSul_6    | 
+| calibration | SodSul_4    | S_foxtrot   | 
+| check       | SodSul_2    | S_charlie   | 
+
+  **Samples to ignore**: `r SAMPLES_TO_IGNORE`
+
+  **Sample Peak Definition**:
+
+  - PEAK_DEFINITION_STRATEGY = `r PEAK_DEFINITION_STRATEGY` (`r SAMPLE_PEAK_START` to `r SAMPLE_PEAK_END`)
+    - Current options are: 'smoothed_derivative', 'trimmed_median', 'combined', 'manual'. 'smoothed_derivative' is the method we have been working with for some time. 'trimmed_median' is from Jack\'s manuscript. 'combined' is both. 'manual' is, well, I am sure you get it by now.
+
+
+  If you wish to work with the data interactively, after rendering this markdown file, run the following code:
+
+  - rm(list=ls())
+  - load('workspace.RData')
+
+</details>
+
+```{r file-and-directory-setup, echo=FALSE, include=FALSE}
+
+isox_full_path <- file.path(DATA_DIRECTORY, RUN_DIRECTORY, ISOX_DIRECTORY, ISOX_FILENAME)
+
+high_res_directory <- "high_res/"
+if (!dir.exists(high_res_directory)) {
+  dir.create(high_res_directory, recursive = TRUE)
+  message("Directory created: ", high_res_directory)
+} else {
+  message("Directory already exists: ", high_res_directory)
+}
+```
+
+```{r read-reference-materials-json, include=FALSE, echo=FALSE}
+ref_mat <- fromJSON(REFERENCE_MATERIALS_FILE)
+
+all_sulfate_keys <- names(ref_mat$sulfates)
+sodium_sulfate_keys <- keep(
+  all_sulfate_keys,
+  ~ {
+    m <- pluck(ref_mat, "sulfates", .x, "material", .default = NA_character_)
+    !is.na(m) && tolower(trimws(m)) == "sodium sulfate"
+  }
+)
+
+# knitr::knit_exit()
+
+```
+
+```{r read-raw-files, echo=FALSE, include=FALSE, eval=TRUE}
+
+# parallel processing setup
+Sys.setenv(
+  OMP_NUM_THREADS = "1",
+  MKL_NUM_THREADS = "1",
+  OPENBLAS_NUM_THREADS = "1",
+  NUMEXPR_NUM_THREADS = "1"
+)
+
+all_cores <- future::availableCores()
+reserve   <- 10
+workers   <- max(1, min(32, all_cores) - reserve)
+message(sprintf("Using %d workers (available=%d, reserve=%d).", workers, all_cores, reserve))
+plan(multisession, workers = workers)
+
+
+raw_files_dir  <- file.path(DATA_DIRECTORY, RUN_DIRECTORY, RAW_DIRECTORY)
+raw_files      <- orbi_find_raw(raw_files_dir)
+stopifnot(length(raw_files) > 0)
+
+# remove samples to ignore
+sample_names <- sub('\\.raw$', "", basename(raw_files))
+raw_files <- raw_files[!sample_names %in% SAMPLES_TO_IGNORE]
+
+sample_order <- as.integer(sub(".*_(\\d+)\\.raw$", "\\1", raw_files))
+raw_files <- raw_files[order(sample_order)]
+
+
+each_injection <- list()
+rows <- list()
+
+## --- safe wrapper + options ---
+safe_one <- purrr::safely(process_one_raw_file, otherwise = NULL)
+
+# NOTE: pass packages and any constants used inside workers explicitly
+opts <- furrr::furrr_options(
+  seed = TRUE,
+  scheduling = 2, # if I/O heavy and file sizes vary, keep >=2
+  packages  = c("dplyr","tidyr","purrr","ggplot2","fs","tools","stringr") # plus what you use
+  # globals = c("ISOTOPOCULES","RUN_DIRECTORY","PEAK_DEFINITION_STRATEGY",
+  #             "SAMPLE_PEAK_START","SAMPLE_PEAK_END")  # add if referenced inside process_one_injection()
+)
+
+results <- furrr::future_map(
+  raw_files,
+  ~ safe_one(.x, high_res_directory),
+  .options = opts
+)
+
+## --- unwrap: each_injection, rows, summary, errors ---
+named_results <- purrr::set_names(results, tools::file_path_sans_ext(basename(raw_files)))
+
+ok <- named_results |>
+  purrr::keep(~ is.null(.x$error)) |>
+  purrr::map("result")
+
+errs <- named_results |>
+  purrr::keep(~ !is.null(.x$error)) |>
+  purrr::imap(\(x, fname) {
+    tibble(
+      filename = fname,
+      message  = conditionMessage(x$error),
+      class    = paste(class(x$error), collapse = "/")
+    )
+  }) |>
+  dplyr::bind_rows()
+
+each_injection <- ok
+rows           <- purrr::map(ok, "row")
+ruby_data_summary <- dplyr::bind_rows(rows)
+
+```
+
+<details><summary class="expandable_subtitles">High Resolution Data</summary>
+
+```{r high-res-summary-figures, fig.width=12, fig.height=8, fig.show='hold', echo=FALSE}
+knitr::opts_chunk$set(fig.show = "hold")
+fig_n <- 1
+run_figures <- list()
+
+title_text =  sprintf("Figure %d - TIC vs sample order", fig_n)
+run_figures[[fig_n]] <- list(
+    title_text =  title_text,
+    anchor = sprintf("fig%d", fig_n),
+    caption_text = "Total Ion Count versus sample order",
+    plot = ggplot(ruby_data_summary) + 
+        geom_errorbar(aes(x = sample_order, ymin = TICmean - TICsd, ymax = TICmean + TICsd, color = sample_name),
+                      width = 0.2, linewidth = 1) +
+        geom_point(aes(x=sample_order, y=TICmean, color = sample_name), size = I(5)) +
+        geom_text(aes(x = sample_order, y = TICmean, label = sample_order), 
+            color = "black", size = 2.5, fontface = "bold", vjust = 0.35) +  
+        labs(title = title_text) +
+        theme_minimal())
+print(run_figures[[fig_n]]$plot)
+
+fig_n <- fig_n + 1
+
+title_text =  sprintf("Figure %d - OIC vs sample order", fig_n)
+run_figures[[fig_n]] <- list(
+    title_text =  title_text,
+    anchor = sprintf("fig%d", fig_n),
+    caption_text = "Orbitrap Ion Count versus sample order",
+    plot = ggplot(ruby_data_summary) + 
+        geom_errorbar(aes(x = sample_order, ymin = OICmean - OICsd, ymax = OICmean + OICsd, color = sample_name),
+                      width = 0.2, linewidth = 1) +
+        geom_point(aes(x=sample_order, y=OICmean, color = sample_name), size = I(5)) +
+        geom_text(aes(x = sample_order, y = OICmean, label = sample_order), 
+            color = "black", size = 2.5, fontface = "bold", vjust = 0.35) +  
+        labs(title = title_text) +
+        theme_minimal())
+print(run_figures[[fig_n]]$plot)
+```
+
+```{r emit-sample-sections, results='asis', comment=NA, echo=FALSE, message=FALSE, warning=FALSE}
+for (rec in each_injection) {
+  cat(sprintf('<details class="high_res_sample"><summary>%s</summary>\n', rec$filename))
+  cat(sprintf('Ten largest peaks: %s\n', rec$top10peaks))
+  cat('<div style="display:flex; gap:0.5rem; flex-wrap:wrap;">\n')
+  for (img in rec$images) {
+    cat(sprintf(
+      '<img src="%s" style="max-width:30%%; height:auto;">\n',
+      img
+    ))
+  }
+  cat('</div>\n')
+  
+  if (!is.null(rec$largest_peaks) && nrow(rec$largest_peaks) > 0) {
+
+    cat('<div class="section-indent">Ten largest peaks: <table style="border-collapse:collapse; margin-top:1rem;">\n')
+    cat('<tr>',
+        '<th style="border:1px solid #ccc; padding:4px;">Mean m/z</th>',
+        '<th style="border:1px solid #ccc; padding:4px;">Mean Intensity</th>',
+        '</tr>\n')
+    for (i in seq_len(nrow(rec$largest_peaks))) {
+      cat('<tr>',
+          sprintf('<td style="border:1px solid #ccc; padding:4px;">%.4f</td>', rec$largest_peaks$mean_mz[i]),
+          sprintf('<td style="border:1px solid #ccc; padding:4px;">%.0f</td>', rec$largest_peaks$peak_intensity[i]),
+          '</tr>\n')
+    }
+    cat('</table></div>\n')
+  }
+  
+  
+  
+  
+  
+  cat('</details>\n\n')
+}
+```
+
+</details>
+
+<details><summary class="expandable_subtitles">Analyzer Temperature</summary>
+
+```{r organize-data, echo=FALSE, include=FALSE}
+message('\n ---------- sort based on sample order ----------')
+ruby_data_summary <- ruby_data_summary[order(ruby_data_summary$sample_order), ]
+
+ruby_data_summary <- ruby_data_summary %>%
+  rename(
+    R34S = R34Smean,
+    R33S = R33Smean,
+    R18O = R18Omean,
+    R17O = R17Omean
+  )
+
+
+```
+
+Analyzer temperature is stored in the .raw data files. While we still dont know where exactly in the instrument this measurement originates, it does track with lab temperature. Furthermore, it also seems to explain much of the ratio variability. This Ruby-only version of the code does not yet have a way to flag temperature variability data like previous Stella vs Ruby scripts did.
+
+```{r AnalyzerTemperature, echo=FALSE, fig.width=10, fig.height=6}
+plot_temperature(ruby_data_summary)
+```
+
+</details>
+
+<details><summary class="expandable_subtitles">Bracketing References</summary>
+
+```{r bracketing, include=FALSE, echo=FALSE}
+message('\n ---------- ***** bracketing ***** ----------')
+bracketing_references <- subset(ruby_data_summary, sample_name == BRACKETING_REFERENCE)
+analyses <- subset(ruby_data_summary, sample_name != BRACKETING_REFERENCE)
+message("\nwM0 rows in bracketing references:", nrow(bracketing_references))
+message("wM0 rows in other analyses:", nrow(analyses))
+
+message('\n ---------- find the nearest standard before and after for each sample ----------')
+analyses <- analyses %>%
+  rowwise() %>%
+  mutate(
+    nearest_ref_before = find_nearest(sample_order, bracketing_references$sample_order)[1],
+    nearest_ref_after = find_nearest(sample_order, bracketing_references$sample_order)[2]
+  ) %>%
+  ungroup()
+
+analyses <- analyses %>%
+  left_join(
+    bracketing_references %>%
+      select(sample_order, analyzerTmean, TICmean) %>%
+      rename(nearest_ref_before = sample_order, mean_temp_before = analyzerTmean, TIC_before = TICmean),
+    by = "nearest_ref_before"
+  ) %>%
+  left_join(
+    bracketing_references %>%
+      select(sample_order, analyzerTmean, TICmean) %>%
+      rename(nearest_ref_after = sample_order, mean_temp_after = analyzerTmean, TIC_after = TICmean),
+    by = "nearest_ref_after"
+  ) %>%
+  mutate(
+    diff_temp_before = abs(analyzerTmean - mean_temp_before),
+    diff_temp_after = abs(analyzerTmean - mean_temp_after),
+    diff_TIC = ((TICmean-TIC_before)+(TICmean-TIC_after))/2,
+    ratio_TIC = TICmean/((TIC_before+TIC_after)/2)
+  )
+
+message('\n ---------- wM0 - join to get R34S, R33S, R18O, and R17O for nearest before and after ----------')
+analyses <- analyses %>%
+  left_join(
+    bracketing_references %>% 
+      select(sample_order, R34S, R33S, R18O, R17O) %>%
+      rename(nearest_ref_before = sample_order, 
+             R34S_before = R34S, R33S_before = R33S, 
+             R18O_before = R18O, R17O_before = R17O),
+    by = "nearest_ref_before"
+  ) %>%
+  left_join(
+    bracketing_references %>%
+      select(sample_order, R34S, R33S, R18O, R17O) %>%
+      rename(nearest_ref_after = sample_order, 
+             R34S_after = R34S, R33S_after = R33S, 
+             R18O_after = R18O, R17O_after = R17O),
+    by = "nearest_ref_after"
+  ) %>%
+  rowwise() %>%
+  mutate(
+    R34S_ref = compute_ref(R34S_before, R34S_after, diff_temp_before, diff_temp_after),
+    R33S_ref = compute_ref(R33S_before, R33S_after, diff_temp_before, diff_temp_after),
+    R18O_ref = compute_ref(R18O_before, R18O_after, diff_temp_before, diff_temp_after),
+    R17O_ref = compute_ref(R17O_before, R17O_after, diff_temp_before, diff_temp_after)
+  ) %>%
+  ungroup() %>%
+  select(-R34S_before, -R34S_after, -R33S_before, -R33S_after, 
+         -R18O_before, -R18O_after, -R17O_before, -R17O_after)
+
+
+ratio_cols <- c("R34S", "R33S", "R18O", "R17O")
+ref_ratio_cols <- c("R34S_ref", "R33S_ref", "R18O_ref", "R17O_ref")
+deltas <- (analyses[, ratio_cols] / analyses[, ref_ratio_cols] - 1)*1000
+colnames(deltas) <- sub("^R", "d", colnames(deltas))
+analyses <- cbind(analyses, deltas)
+analyses$D17O <- analyses$d17O - 0.52 * analyses$d18O
+
+message('\n ===== data frame output:  analyses  =====')
+```
+
+```{r visualize-bracketing-references, echo=FALSE, fig.width=10, fig.height=6}
+
+Fig__R34S_vs_order <- ggplot() +
+geom_point(data = bracketing_references,
+              mapping = aes(x = sample_order, 
+                            y = R34S, 
+                            color = sample_name)) +   
+geom_point(data = analyses, 
+              mapping = aes(x = sample_order,
+                            y = R34S,
+                            color = sample_name), 
+           size = I(6)) +
+geom_text(data = analyses,
+        mapping = aes(x = sample_order, 
+                      y = R34S,
+                      label = sample_order),
+        vjust = 0.5, hjust = 0.5, color = "black")+
+labs(
+  title = paste0("R34S vs sample order."),
+  x = "Sample order",
+  y = "R34S") +
+theme_minimal() +
+theme(
+  axis.line = element_line(color = "black", linewidth = 1),
+  panel.border = element_rect(color = "black", fill = NA, linewidth = 1),
+  legend.position = "right",  # Places legend outside the plot
+  legend.text = element_text(size = 14),  # Increase legend font size
+  plot.title = element_text(size = 16, face = "bold"),  # Adjust title size
+  axis.title = element_text(size = 14),  # Adjust axis labels
+  axis.text = element_text(size = 12)  # Adjust axis text
+)
+print(Fig__R34S_vs_order)
+
+Fig__R34Sref_vs_order <- ggplot() +
+geom_point(data = bracketing_references,
+              mapping = aes(x = sample_order, 
+                            y = R34S, 
+                            color = sample_name)) +   
+geom_point(data = analyses, 
+              mapping = aes(x = sample_order,
+                            y = R34S_ref,
+                            color = sample_name), 
+           size = I(6)) +
+geom_text(data = analyses,
+        mapping = aes(x = sample_order, 
+                      y = R34S_ref,
+                      label = sample_order),
+        vjust = 0.5, hjust = 0.5, color = "black")+
+labs(
+  title = paste0("Bracketing references R34S vs sample order."),
+  x = "Sample order",
+  y = "Bracketing reference R34S") +
+theme_minimal() +
+theme(
+  axis.line = element_line(color = "black", linewidth = 1),
+  panel.border = element_rect(color = "black", fill = NA, linewidth = 1),
+  legend.position = "right",  # Places legend outside the plot
+  legend.text = element_text(size = 14),  # Increase legend font size
+  plot.title = element_text(size = 16, face = "bold"),  # Adjust title size
+  axis.title = element_text(size = 14),  # Adjust axis labels
+  axis.text = element_text(size = 12)  # Adjust axis text
+)
+print(Fig__R34Sref_vs_order)
+
+Fig__R34Sref_vs_AnalyzerT <- ggplot() +
+    geom_point(data = analyses, 
+               mapping = aes(x = analyzerTmean,
+                             y = R34S_ref,
+                             color = sample_name), 
+               size = I(6)) +
+    geom_text(data = analyses,
+              mapping = aes(x = analyzerTmean, 
+                            y = R34S_ref,
+                            label = sample_order),
+              vjust = 0.5, hjust = 0.5, color = "black") +
+    labs(title = paste0("R34S_ref vs Analyzer temperature"),
+         x = "Mean Analyzer Temp (*C)",
+         y = "Bracketing Reference R34S") +
+    theme_minimal() +
+    theme(
+      axis.line = element_line(color = "black", linewidth = 1),
+      panel.border = element_rect(color = "black", fill = NA, linewidth = 1),
+      legend.position = "right",  # Places legend outside the plot
+      legend.text = element_text(size = 14),  # Increase legend font size
+      plot.title = element_text(size = 16, face = "bold"),  # Adjust title size
+      axis.title = element_text(size = 14),  # Adjust axis labels
+      axis.text = element_text(size = 12)  # Adjust axis text
+    )
+print(Fig__R34Sref_vs_AnalyzerT)
+```
+
+Numbered symbols show the mean bracketing reference R34S. Smaller pink dots show the measured bracketing reference R34S.
+
+</details>
+
+<details><summary class="expandable_subtitles">Raw Data Summary</summary>
+
+```{r summarize-replicates, echo=FALSE}
+run_summary <- analyses %>%
+  group_by(sample_name) %>%
+  summarise(
+    n = sum(!is.na(d34S)),
+    d34S_mean_val = mean(d34S, na.rm=TRUE),
+    d34S_sd_val = sd(d34S, na.rm=TRUE),
+    d33S_mean_val = mean(d33S, na.rm=TRUE),
+    d33S_sd_val = sd(d33S, na.rm=TRUE),        
+    d18O_mean_val = mean(d18O, na.rm=TRUE),
+    d18O_sd_val = sd(d18O, na.rm=TRUE),
+    d17O_mean_val = mean(d17O, na.rm=TRUE),
+    d17O_sd_val = sd(d17O, na.rm=TRUE),
+    D17O_mean_val = mean(D17O, na.rm=TRUE),
+    D17O_sd_val = sd(D17O, na.rm=TRUE),
+    mean_tic_val = mean(TICmean, na.rm=TRUE),
+    sd_tic_val = sd(TICmean, na.rm=TRUE),
+    mean_tic_diff = mean(diff_TIC, na.rm=TRUE),
+    sd_tic_diff = sd(diff_TIC, na.rm=TRUE),
+    mean_tic_ratio = mean(ratio_TIC, na.rm=TRUE),
+    sd_tic_ratio = sd(ratio_TIC, na.rm=TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    d34S_mean = round(d34S_mean_val, 1),
+    d34S_sd = round(d34S_sd_val, 2),
+    d33S_mean = round(d33S_mean_val, 1),
+    d33S_sd = round(d33S_sd_val, 2),
+    d18O_mean = round(d18O_mean_val, 2),
+    d18O_sd = round(d18O_sd_val, 2),
+    d17O_mean = round(d17O_mean_val, 2),
+    d17O_sd = round(d17O_sd_val, 2),
+    D17O_mean = round(D17O_mean_val, 2),
+    D17O_sd = round(D17O_sd_val, 2),
+    TICmean = formatC(mean_tic_val, format = "e", digits = 2),
+    TICsd = formatC(sd_tic_val, format = "e", digits = 2),
+    TICdiff = formatC(mean_tic_diff, format = "e", digits = 2),
+    TICdiffsd = formatC(sd_tic_diff, format = "e", digits = 2),
+    TICratio = formatC(mean_tic_ratio, format = "e", digits = 2),
+    TICratiosd = formatC(sd_tic_ratio, format = "e", digits = 2),
+    run_name = RUN_DIRECTORY,
+    run_date = substr(RUN_DIRECTORY, 1, 6),
+    concentration = extract_conc(sample_name)   # ← add here
+  ) %>%
+  select(sample_name, n,
+         TICmean, TICsd, TICdiff, TICdiffsd, TICratio, TICratiosd,
+         d34S_mean, d34S_sd, d18O_mean, d18O_sd,
+         D17O_mean, D17O_sd,
+         d17O_mean, d17O_sd, d33S_mean, d33S_sd,
+         run_name, run_date, concentration)
+
+scale_compression <- round(100 * (1 - (run_summary$d34S_mean[run_summary$sample_name=='S_MIF_2']-run_summary$d34S_mean[run_summary$sample_name=='SodSul_8']) / 30.9), 0)
+
+# -------------------- Raw data summary table --------------------
+run_summary_table_col_names <- c("Sample<br>Name", "n", "TIC<br>Mean", "TIC<br>SD", "TICdiff","TICdiffsd", "TICratio", "TICratiosd",
+               "&#948;<sup>34</sup>S<br>Mean<br>(&#8240;)", "&#948;<sup>34</sup>S<br>SD",
+               "&#948;<sup>18</sup>O<br>Mean<br>(&#8240;)", "&#948;<sup>18</sup>O<br>SD",
+               "&#916;<sup>17</sup>O<br>Mean<br>(&#8240;)", "&#916;<sup>17</sup>O<br>SD")
+run_summary_display_columns <- c("sample_name", "n", "TICmean", "TICsd","TICdiff","TICdiffsd","TICratio","TICratiosd",
+                                     "d34S_mean", "d34S_sd",
+                                     "d18O_mean", "d18O_sd",
+                                     "D17O_mean", "D17O_sd")
+
+caption_text <- paste("Summary of measured &#948;<sup>34</sup>S, &#948;<sup>18</sup>O, and &#916;<sup>17</sup>O versus the bracketing standard. Scale compression based on d34S of S-MIF-2 and SodSul-8 = ", scale_compression, " %.")
+
+knitr::kable(run_summary[, run_summary_display_columns], format = "html", caption = caption_text, 
+             align = "c", col.names = run_summary_table_col_names, escape = FALSE) %>%
+  column_spec(1, bold = TRUE)  # Makes the first column bold
+
+
+```
+
+</details>
+
+<details><summary class="expandable_subtitles">Calibration to VCDT and VSMOW</summary>
+
+```{r Reference-Material-Data-Frames, echo=FALSE}
+# -------------------- CREATE REFERENCE MATERIAL DATA FRAMES FOR CALIBRATION --------------------
+
+get_RM_calibration_values <- function(standards, delta, run_summary, ref_mat) {
+  # Helper to get aliases for each RM key
+  get_RM_names <- function(RM_key) {
+    purrr::pluck(ref_mat, "sulfates", RM_key, "names", .default = character(0))
+  }
+  # Helper to get true/reference value
+  get_RM_delta <- function(RM_key) {
+    purrr::pluck(ref_mat, "sulfates", RM_key, delta, .default = NA_real_)
+  }
+  # Helper to get measured mean from run_summary
+  get_measured_mean <- function(aliases) {
+    col <- paste0(delta, "_mean")
+    if (!col %in% names(run_summary)) return(NA_real_)
+    mean(run_summary[[col]][run_summary$sample_name %in% aliases], na.rm = TRUE)
+  }
+  
+  tibble(name = standards) %>%
+    mutate(
+      ref_names = purrr::map(name, get_RM_names),
+      meas_vs_M0 = purrr::map_dbl(ref_names, get_measured_mean),
+      accepted  = purrr::map_dbl(name, get_RM_delta)
+    ) %>%
+    select(name, meas_vs_M0, accepted)
+}
+
+RM_17O <- get_RM_calibration_values(d17O_CALIBRATION_STANDARDS, "d17O", run_summary, ref_mat) %>% dplyr::rename(VSMOW = accepted)
+RM_18O <- get_RM_calibration_values(d18O_CALIBRATION_STANDARDS, "d18O", run_summary, ref_mat) %>% dplyr::rename(VSMOW = accepted)
+RM_33S <- get_RM_calibration_values(d33S_CALIBRATION_STANDARDS, "d33S", run_summary, ref_mat) %>% dplyr::rename(VCDT = accepted)
+RM_34S <- get_RM_calibration_values(d34S_CALIBRATION_STANDARDS, "d34S", run_summary, ref_mat) %>% dplyr::rename(VCDT = accepted)
+```
+
+```{r Calibrate-to-VCDT-VSMOW, echo=FALSE}
+# -------------------- CALIBRATE d34S to VCDT and d18O to VSMOW --------------------
+# Correct to VCDT by doing a three-point calibration, which is a linear regression of the three accepted values relative to their measured ratios
+# NOTE: Jongebloed et al. (2023a GRL; 2023b, ERL) used a 4-point calibration. This was made possible by aggregating data over many Shrek runs. If the orbitrap uncalibrated deltas change day-to-day, this might not be possible
+
+model_34S <- lm(VCDT ~ meas_vs_M0, data = RM_34S)
+slope_34S <- coef(model_34S)[2]
+intercept_34S <- coef(model_34S)[1]
+run_summary$d34S_VCDT <- slope_34S*run_summary$d34S_mean + intercept_34S
+
+model_33S <- lm(VCDT ~ meas_vs_M0, data = RM_33S)
+slope_33S <- coef(model_33S)[2]
+intercept_33S <- coef(model_33S)[1]
+run_summary$d33S_VCDT <- slope_33S*run_summary$d33S_mean + intercept_33S
+
+model_18O <- lm(VSMOW ~ meas_vs_M0, data = RM_18O)
+slope_18O <- coef(model_18O)[2]
+intercept_18O <- coef(model_18O)[1]
+run_summary$d18O_VSMOW <- slope_18O*run_summary$d18O_mean + intercept_18O
+
+model_17O <- lm(VSMOW ~ meas_vs_M0, data = RM_17O)
+slope_17O <- coef(model_17O)[2]
+intercept_17O <- coef(model_17O)[1]
+run_summary$d17O_VSMOW <- slope_17O*run_summary$d17O_mean + intercept_17O
+
+aliases_table <- tibble(
+  key = sodium_sulfate_keys,
+  alias = map(key, ~ pluck(ref_mat, "sulfates", .x, "names", .default = character(0))),
+  d34Sacc = map_dbl(key, ~ pluck(ref_mat, "sulfates", .x, "d34S", .default = NA_real_)),
+  d33Sacc = map_dbl(key, ~ pluck(ref_mat, "sulfates", .x, "d33S", .default = NA_real_)),
+  d18Oacc = map_dbl(key, ~ pluck(ref_mat, "sulfates", .x, "d18O", .default = NA_real_)),
+  d17Oacc = map_dbl(key, ~ pluck(ref_mat, "sulfates", .x, "d17O", .default = NA_real_))
+) %>%
+  unnest_longer(alias)
+
+run_summary <- run_summary %>%
+  left_join(
+    aliases_table %>% select(alias, d34Sacc, d33Sacc, d18Oacc, d17Oacc),
+    by = c("sample_name" = "alias")
+  )
+
+# go back and calibrate individual analyses so we can estimate errors
+analyses$d33S_VCDT <- slope_33S*analyses$d33S+intercept_33S
+analyses$d34S_VCDT <- slope_34S*analyses$d34S+intercept_34S
+analyses$d17O_VSMOW <- slope_17O*analyses$d17O+intercept_17O
+analyses$d18O_VSMOW <- slope_18O*analyses$d18O+intercept_18O
+
+run_summary_errors <- analyses %>%
+  group_by(sample_name) %>%
+  summarise(
+    n = sum(!is.na(d34S_VCDT)),
+    d33S_sd_val = sd(d33S_VCDT, na.rm=TRUE),
+    d33S_VCDT_95CI = 1.96 * d33S_sd_val / sqrt(n),
+    d34S_sd_val = sd(d34S_VCDT, na.rm=TRUE),
+    d34S_VCDT_95CI = 1.96 * d34S_sd_val / sqrt(n),
+    d17O_sd_val = sd(d17O_VSMOW, na.rm=TRUE),
+    d17O_VSMOW_95CI = 1.96 * d17O_sd_val / sqrt(n),
+    d18O_sd_val = sd(d18O_VSMOW, na.rm=TRUE),
+    d18O_VSMOW_95CI = 1.96 * d18O_sd_val / sqrt(n),
+    .groups = "drop"
+)
+
+# add newly calculated errors to summary data frame
+run_summary <- run_summary %>%
+  left_join(
+    run_summary_errors %>%
+      select(sample_name, d33S_VCDT_95CI, d34S_VCDT_95CI, d17O_VSMOW_95CI, d18O_VSMOW_95CI),
+    by = "sample_name"
+  )
+```
+
+```{r export-analyses-data, echo=FALSE, include=FALSE}
+write.csv(analyses, paste0(DATA_DIRECTORY,"/", RUN_DIRECTORY,"/",RUN_DIRECTORY,"__analyses_export.csv"), row.names = FALSE)
+```
+
+```{r export-run-summary, echo=FALSE, include=FALSE}
+
+run_summary[] <- lapply(run_summary, function(x) {
+  tmp <- suppressWarnings(as.numeric(x))
+  if (sum(!is.na(tmp)) >= sum(!is.na(x)) / 2) tmp else x
+})
+
+run_summary_column_order <- c("run_name", "run_date", "sample_name", "n", "concentration",
+                              "TICmean", "TICsd", "TICdiff", "TICdiffsd", "TICratio", "TICratiosd",
+                              "d33S_mean", "d33S_sd", "d33S_VCDT", "d33S_VCDT_95CI", "d33Sacc",
+                              "d34S_mean", "d34S_sd", "d34S_VCDT", "d34S_VCDT_95CI", "d34Sacc",
+                              "d17O_mean", "d17O_sd", "d17O_VSMOW", "d17O_VSMOW_95CI", "d17Oacc",
+                              "d18O_mean", "d18O_sd", "d18O_VSMOW", "d18O_VSMOW_95CI", "d18Oacc")
+run_summary <- run_summary[run_summary_column_order]
+write.csv(run_summary, paste0(DATA_DIRECTORY,"/", RUN_DIRECTORY,"/",RUN_DIRECTORY,"__run_summary.csv"), row.names = FALSE)
+```
+
+```{r Samples-Summary-Table, echo=FALSE}
+samples_summary <- run_summary %>%
+  mutate(
+    sample_name = sample_name,
+    n = n,
+
+    d34S_mean = round(d34S_VCDT, 1),
+    d34S_bias = round(d34S_VCDT-d34Sacc, 1),
+    d34S_95CI = round(d34S_VCDT_95CI, 2),
+
+    d33S_mean = round(d33S_VCDT, 1),
+    d33S_bias = round(d33S_VCDT-d33Sacc, 1),
+    d33S_95CI = round(d33S_VCDT_95CI, 2),
+        
+    d18O_mean = round(d18O_VSMOW, 1),
+    d18O_bias = round(d18O_VSMOW-d18Oacc, 1),
+    d18O_95CI = round(d18O_VSMOW_95CI, 2),
+
+    d17O_mean = round(d17O_VSMOW, 1),
+    d17O_bias = round(d17O_VSMOW-d17Oacc, 1),
+    d17O_95CI = round(d17O_VSMOW_95CI, 2)
+  ) %>%
+  
+  select(sample_name, n, d34S_mean, d34S_95CI, d34S_bias, d18O_mean, d18O_95CI, d18O_bias, d33S_mean, d33S_95CI, d33S_bias, d17O_mean, d17O_95CI, d17O_bias)
+
+samples_summary_table_col_names <- c("Sample<br>Name", "n",
+               "&#948;<sup>34</sup>S<br>Mean<br>VCDT<br>(&#8240;)",
+               "&#948;<sup>34</sup>S<br>95%<br>CI",
+               "&#948;<sup>34</sup>S<br>bias", 
+               "&#948;<sup>18</sup>O<br>Mean<br>VSMOW<br>(&#8240;)",
+               "&#948;<sup>18</sup>O<br>95%<br>CI",
+               "&#948;<sup>18</sup>O<br>bias",
+               "&#948;<sup>33</sup>S<br>Mean<br>VCDT<br>(&#8240;)",
+               "&#948;<sup>33</sup>S<br>95%<br>CI",
+               "&#948;<sup>33</sup>S<br>bias",
+               "&#948;<sup>17</sup>O<br>Mean<br>VSMOW<br>(&#8240;)",
+               "&#948;<sup>17</sup>O<br>95%<br>CI",
+               "&#948;<sup>17</sup>O<br>bias")
+
+caption_text <- paste("Summary of calibrated &#948;<sup>34</sup>S, &#948;<sup>18</sup>O, &#948;<sup>33</sup>S and &#948;<sup>17</sup>O.")
+
+knitr::kable(samples_summary, format = "html", caption = caption_text, 
+             align = "c", col.names = samples_summary_table_col_names, escape = FALSE) %>%
+  column_spec(1, bold = TRUE)  # Makes the first column bold
+```
+
+</details>
+
+<details><summary class="expandable_subtitles">Replicate Calibrated Data</summary>
+
+These figures are intended to provide a sense of sample spread.
+
+```{r individual-replicate-assessment, echo=FALSE, fig.width=10, fig.height=6}
+
+# All sample names present in this run (with non-NA d34S_VCDT)
+sample_levels <- analyses %>%
+  filter(!is.na(d34S_VCDT)) %>%
+  arrange(sample_name, sample_order) %>%
+  pull(sample_name) %>%
+  unique()
+
+# Filter your main dataframe to remove NAs
+samples_df_noNA <- analyses %>%
+  filter(!is.na(d34S_VCDT)) %>%
+  mutate(
+    sample_name = factor(sample_name, levels = sample_levels)
+  )
+
+# Order and position samples
+samples_df_order <- samples_df_noNA %>%
+  arrange(sample_name, sample_order) %>%
+  mutate(
+    x_pos = as.numeric(sample_name) +
+      (sample_order - min(sample_order)) * 0.010
+  )
+
+# Compute shading width from actual sample extents
+shading_extents <- samples_df_order %>%
+  group_by(sample_name) %>%
+  summarise(
+    x_min = min(x_pos) - 0.05,
+    x_max = max(x_pos) + 0.05,
+    .groups = "drop"
+  )
+
+# Prepare shading values from scratch
+shading_values <- tibble(sample_name = sample_levels) %>%
+  mutate(
+    shade_y = purrr::map_dbl(
+      sample_name,
+      ~ purrr::pluck(ref_mat, "sulfates", .x, "d34S", .default = NA_real_)
+    )
+  ) %>%
+  left_join(shading_extents, by = "sample_name") %>%
+  mutate(
+    y_min = shade_y - 0.8,
+    y_max = shade_y + 0.8
+  ) %>%
+  filter(!is.na(shade_y))
+
+
+Fig_delta34S_vs_order <- ggplot(samples_df_order,
+                                aes(x = x_pos, y = d34S_VCDT, color = sample_name)) +
+
+  geom_rect(
+    data = shading_values,
+    aes(xmin = x_min, xmax = x_max, ymin = y_min, ymax = y_max),
+    fill = "gray80", alpha = 0.5, inherit.aes = FALSE
+  ) +
+  geom_point(size = 5) +
+  geom_text(aes(label = sample_order), vjust = 0.5, hjust = 0.5, color = "black") +
+  scale_x_continuous(breaks = NULL) +   # hide x labels
+  labs(
+    x = "Sample Type",
+    y = expression(delta^34*"S (VCDT)"),
+    color = "Sample Name"               # legend appears
+  ) +
+  theme_minimal() +
+  theme(legend.position = "right")
+
+print(Fig_delta34S_vs_order)
+
+
+run_summary_concentration <- run_summary[!is.na(run_summary$concentration), ]
+if (nrow(run_summary_concentration)>0){
+Fig_d34S_vs_TIC <- ggplot(run_summary_concentration, aes(x=TICmean, y=d34S_VCDT, color=sample_name)) +
+                                    geom_point(size = 5) +
+                                    geom_errorbar(aes(ymin = d34S_VCDT - d34S_VCDT_95CI,
+                                                    ymax = d34S_VCDT + d34S_VCDT_95CI),
+                                                width = 0.2,
+                                                linewidth = 0.8) +
+                                    labs(x = "TIC", y = expression(delta^34*"S (VCDT)"), color = "Sample Name") +
+                                    theme_minimal()
+print(Fig_d34S_vs_TIC)
+
+
+Fig_d34S_vs_TICratio <- ggplot(run_summary_concentration, aes(x=TICratio, y=d34S_VCDT, color=sample_name)) +
+                                    geom_point(size = 5) +
+                                    geom_errorbar(aes(ymin = d34S_VCDT - d34S_VCDT_95CI,
+                                                    ymax = d34S_VCDT + d34S_VCDT_95CI),
+                                                width = 0.2,
+                                                linewidth = 0.8) +
+                                    labs(x = "TICratio", y = expression(delta^34*"S (VCDT)"), color = "Sample Name") +
+                                    theme_minimal()
+print(Fig_d34S_vs_TICratio)
+
+
+Fig_d34S_vs_concentration <- ggplot(run_summary_concentration, aes(x=concentration, y=d34S_VCDT, color=sample_name)) +
+                                    geom_point(size = 5) +
+                                    geom_errorbar(aes(ymin = d34S_VCDT - d34S_VCDT_95CI,
+                                                    ymax = d34S_VCDT + d34S_VCDT_95CI),
+                                                width = 0.2,
+                                                linewidth = 0.8) +
+                                    labs(x = "Sample Concentration (uM)", y = expression(delta^34*"S (VCDT)"), color = "Sample Name") +
+                                    theme_minimal()
+print(Fig_d34S_vs_concentration)
+
+
+Fig_tic_vs_concentration <- ggplot(run_summary_concentration, aes(x=concentration, y=TICmean, color=sample_name)) +
+                                    geom_point(size = 5) +
+                                    geom_errorbar(aes(ymin = TICmean - TICsd,
+                                                    ymax = TICmean + TICsd),
+                                                width = 0.2,
+                                                linewidth = 0.8) +
+                                    labs(x = "Sample Concentration (uM)", y = "TIC", color = "Sample Name") +
+                                    theme_minimal()
+print(Fig_tic_vs_concentration)
+} else {
+  print('No concentration range analyses')
+}
+
+```
+
+```{r residual-figures, echo=FALSE, fig.width=10, fig.height=6}
+
+# Calculate the residual (departure from mean) for all replicated analyses and across all deltas.
+residuals <- analyses %>%
+  group_by(sample_name) %>%
+  mutate(across(c(d34S, d18O, d17O, d33S), ~ . - mean(. , na.rm = TRUE), .names = "{.col}_residual")) %>%
+  ungroup()
+
+d34S_title <- paste0("d34S residual 2-sigma = ", round(sd(residuals$d34S_residual)*2,2))
+Fig_d34Sresidual_vs_order <- ggplot() + 
+      geom_point(data=residuals, mapping=aes(x=sample_order, y=d34S_residual, color=sample_name), size=6) +
+      geom_text(data = residuals, mapping = aes(x = sample_order, y = d34S_residual, label = sample_order)) +
+      labs(title = d34S_title, x = "Sample Order", y = "d34S residual (permil)", color = "Sample Name") +
+      theme_minimal()
+print(Fig_d34Sresidual_vs_order)
+
+Fig_d34Sresidual_vs_TIC <- ggplot() + 
+      geom_point(data=residuals, mapping=aes(x=TICmean, y=d34S_residual, color=sample_name), size=6) +
+      labs(title = d34S_title, x = "Mean TIC", y = "d34S residual (permil)", color = "Sample Name") +
+      theme_minimal()
+print(Fig_d34Sresidual_vs_TIC)
+
+d18O_title <- paste0("d18O residual 2-sigma = ", round(sd(residuals$d18O_residual)*2,2))
+Fig_d18Oresidual_vs_order <- ggplot() + 
+      geom_point(data=residuals, mapping=aes(x=sample_order, y=d18O_residual, color=sample_name), size=6) +
+      labs(title = d18O_title, x = "Sample Order", y = "d18O residual (permil)", color = "Sample Name") +
+      theme_minimal()
+print(Fig_d18Oresidual_vs_order)
+```
+
+</details>
+
+<details><summary class="expandable_subtitles">Reference Materials</summary>
+
+```{r Reference-Material-Table, echo=FALSE}
+# -------------------- CREATE REFERENCE MATERIAL TABLE OF ACCEPTED VALUES --------------------
+
+reference_materials <- tibble(
+  name = sodium_sulfate_keys,
+  d34S = map_dbl(sodium_sulfate_keys, ~ pluck(ref_mat, "sulfates", .x, "d34S", .default = NA_real_)),
+  d18O = map_dbl(sodium_sulfate_keys, ~ pluck(ref_mat, "sulfates", .x, "d18O", .default = NA_real_)),
+  D17O = map_dbl(sodium_sulfate_keys, ~ pluck(ref_mat, "sulfates", .x, "D17O", .default = NA_real_)),
+  d33S = map_dbl(sodium_sulfate_keys, ~ pluck(ref_mat, "sulfates", .x, "d33S", .default = NA_real_)),
+  notes = map_chr(sodium_sulfate_keys, ~ pluck(ref_mat, "sulfates", .x, "notes", .default = NA_character_))
+)
+
+reference_materials_table_col_names <- c("Reference<br>Material",
+                                         "&#948;<sup>34</sup>S<br>VCDT<br>(&#8240;)",
+                                         "&#948;<sup>18</sup>O<br>VSMOW<br>(&#8240;)",
+                                         "&#916;<sup>17</sup>O<br>VSMOW<br>(&#8240;)",
+                                         "&#948;<sup>33</sup>S<br>VCDT<br>(&#8240;)",
+                                         "Notes")
+
+caption_text <- "Table of <strong>accepted values</strong> as taken from reference_materials.json."
+
+knitr::kable(reference_materials, format = "html", caption = caption_text, 
+             align = "c", col.names = reference_materials_table_col_names, escape = FALSE) %>%
+  column_spec(1, bold = TRUE) %>%  # Makes the first column bold
+  column_spec(6, 
+    width = "300px", 
+    extra_css = "font-size: 10px; word-break: break-word;"
+  )
+```
+
+</details>
+
+<details><summary class="expandable_subtitles">Script Change Log</summary>
+
+- 2024-09-16 => Saved from v240912_0918 as Becky's original filename (CalculateDeltas.R) for simplicity.
+- 2024-10-14 => Tried to update in favor of flexible sample names and unknown sample names
+- 2024-10-21 => Adding noM0 as option
+- 2025-01-09 => this version has isoorbi.uw and RUN_DIRECTORY to show figure titles as the run name
+- 2025-01-21 => found bug in plot_tic and plot_ratio functions, they were not working with noM0; other noM0 fixes
+- 2025-01-22 => added .raw file time stamps
+- 2025-01-28 => continued refining this code as an Rmarkdown file
+- 2025-02-03 => initial adjustments for Ruby-only runs, which is basically commenting out lots of lines
+- 2025-02-23 => had gone back to .R, now know how to run and troubleshoot in .Rmd, back to .Rmd, this one is a Ruby-only bracketing based script
+- 2025-03-13 => added ruby sample peak start and end as measurements for each sample rather than fixed values
+- 2025-05-01 => trying to resurrect noM0 after trying HCD fragmentation to SO3
+- 2025-06-05 => trying to make reference material name recognition more versatile. 
+- 2025-06-08 => this version worked for the wM0 and noM0 parts of 250529 and it also seems to calculate the bias correctly
+- 2025-06-12 => table cleanup
+- 2025-08-27 => created user-defined-peak definition and placed it at the top for easier access; cleaned up code; moved analyzer temperature plot and changed its data frame source so bracketing references are plotted; started adding Ursula's figures back in; 
+- 2025-09-09 => moved more frequently changed items to top of script; added boolean for choosing ruby start and end
+- 2025-09-30 => combining high-res-ivan.R with ruby.Rmd, and so far calling it ivanruby.Rmd. Here are some important notes regarding this combination:
+  - ruby.Rmd used the sum method in isoorbi to calculate the ratios (orbi_summarize_results(ratio_method = "sum")). high-res-ivan.R uses dplyr summarize and mean, which, I think, should be identical to isoorbit arithmetic mean. This present code, uses the dplyr summarize mean method.
+- 2025-10-21 => now using melvin
+- 2025-11-13 => raw data support. NOT MORE ISOX. Drew's TIC ratio math as of ivanruby.Rmd in run directory 251107. Jack's manuscript peak definition can be selected. Now need to test on a variety of runs to make sure I have raw data support truly working.
+- 2025-11-18 => SAMPLES_TO_IGNORE works again, it was dead after moving to raw files; 
+- 2025-11-20 => moved analyses export to csv up next to vial level export
+- 2025-12-05 => fix bug in where csv files were being saved
+</details>
+
+```{r, save-workspace, echo=FALSE, include=FALSE}
+save.image(file = file.path(DATA_DIRECTORY, RUN_DIRECTORY,"workspace.RData"))
+```
