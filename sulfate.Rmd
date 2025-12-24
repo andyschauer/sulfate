@@ -11,8 +11,7 @@ output:
 ---
 
 ```{css Style, echo=FALSE}
-h1.title { font-siz
-e: 16px; text-align: right; }
+h1.title { font-size: 16px; text-align: right; }
 h4.author { font-size: 12px; text-align: right; }
 h4.date { font-size: 12px; text-align: right; }
 
@@ -57,6 +56,33 @@ table td{
 
 ```
 
+```{r Libraries, echo=FALSE, include=FALSE}
+library(bslib)
+library(cowplot)
+library(dplyr)
+library(fs)
+library(furrr)
+library(future)
+library(ggplot2)
+library(glue)
+library(grid)
+library(gridExtra)
+library(htmltools)
+library(isoorbi)
+library(jsonlite)
+library(kableExtra)
+library(plotly)
+library(progressr)
+library(purrr)
+library(ragg)
+library(stringr)
+library(tibble)
+library(tidyr)
+library(viridis)
+library(zoo)
+
+```
+
 ```{r Initialization, echo=FALSE, include=FALSE}
 # -------------------- THINGS YOU MAY WANT TO CHANGE RUN-TO-RUN --------------------
 
@@ -72,6 +98,12 @@ ISOTOPOCULES <- c("M0"=96.96010,
                   "34S"=98.95590,
                   "18O"=98.96435)
 
+iso_df <- data.frame(
+  label = names(ISOTOPOCULES),
+  mz    = as.numeric(ISOTOPOCULES)
+)
+
+
 REFERENCE_MATERIALS_FILE <- "/home/disk/melvin/OrbiData/reference_materials/reference_materials.json"
 
 SAMPLES_TO_IGNORE <- c()          # if a particular sample is bad, enter its filename with quotes around it here, e.g. 'SodSul-2-ref_5'
@@ -84,8 +116,8 @@ ABS_DELTA_T_THRESHOLD <- 0.1      # Set threshold of sample vs standard temperat
 
 BRACKETING_REFERENCE <- "SodSul_2_ref"
 
-d17O_CALIBRATION_STANDARDS <- c('SodSul_8', 'S_MIF_2') 
-d18O_CALIBRATION_STANDARDS <- c('SodSul_8', 'S_MIF_2')
+d17O_CALIBRATION_STANDARDS <- c('SodSul_6', 'S_delta') 
+d18O_CALIBRATION_STANDARDS <- c('SodSul_6', 'S_delta')
 d33S_CALIBRATION_STANDARDS <- c('SodSul_8', 'S_MIF_2')
 d34S_CALIBRATION_STANDARDS <- c('SodSul_8', 'S_MIF_2')
 
@@ -93,33 +125,36 @@ PEAK_DEFINITION_STRATEGY <- 'combined'                   # options are:  'smooth
 SAMPLE_PEAK_START <- 1.0
 SAMPLE_PEAK_END <-4.0
 
+# Standards you care about keeping consistent
+STANDARD_NAMES <- c(
+  BRACKETING_REFERENCE,
+  "SodSul_2",
+  "SodSul_4",
+  "SodSul_8",
+  "S_MIF_2"
+)
+
+# Choose distinct colors for standards
+STANDARD_COLORS <- c(
+  setNames("#faad1e", BRACKETING_REFERENCE),
+  "SodSul_2" = "#1b9e77",
+  "SodSul_4" = "#d95f02",
+  "SodSul_8" = "#7570b3",
+  "S_MIF_2"  = "#e7298a"
+)
+
+# Choose distinct shapes for standards (21–25 are nice filled symbols)
+STANDARD_SHAPES <- c(
+  setNames(21, BRACKETING_REFERENCE),
+  "SodSul_2" = 21,
+  "SodSul_4" = 22,
+  "SodSul_8" = 23,
+  "S_MIF_2"  = 24
+)
+NONSTANDARD_PALETTE <- viridis
 ```
 
-```{r Libraries, echo=FALSE, include=FALSE}
-library(bslib)
-library(cowplot)
-library(dplyr)
-library(fs)
-library(furrr)
-library(future)
-library(ggplot2)
-library(glue)
-library(grid)
-library(gridExtra)
-library(htmltools)
-#library(isoorbi.uw)
-library(isoorbi)
-library(jsonlite)
-library(kableExtra)
-library(plotly)
-library(progressr)
-library(purrr)
-library(ragg)
-library(tibble)
-library(tidyr)
-library(zoo)
 
-```
 
 ```{r Functions, echo=FALSE, include=FALSE}
 
@@ -143,6 +178,15 @@ extract_conc <- function(x) {
 }
 
 
+ideal_text_color <- function(hex) {
+  # Convert "#RRGGBB" → numeric RGB
+  rgb <- col2rgb(hex)
+  # Luma formula (standard for perceptual brightness)
+  brightness <- (0.299*rgb[1] + 0.587*rgb[2] + 0.114*rgb[3])
+  if (brightness > 150) "black" else "white"
+}
+
+
 
 process_one_injection <- function(filename, df, high_res_directory) {
 
@@ -150,12 +194,12 @@ process_one_injection <- function(filename, df, high_res_directory) {
     dplyr::distinct(scan.no, .keep_all = TRUE) %>%
     dplyr::select(scan.no, sample_name, sample_order, time.min, ions.incremental, tic, it.ms, oic, analyzerTemperature)
 
-  # Step 1: identify duplicates
+  # identify duplicates
   dups_summary <- df %>%
     dplyr::summarise(n = dplyr::n(), .by = c(scan.no, isotopocule)) %>%
     dplyr::filter(n > 1L)
   
-  # Step 2: if any duplicates, message the user
+  # if any duplicates, message the user
   if (nrow(dups_summary) > 0) {
     message(
       "Note: removed ", sum(dups_summary$n - 1),
@@ -164,13 +208,13 @@ process_one_injection <- function(filename, df, high_res_directory) {
     )
   }
   
-  # Step 3: drop duplicates (keep first row for each scan.no + isotopocule)
+  # drop duplicates (keep first row for each scan.no + isotopocule)
   df_nodups <- df %>%
     dplyr::group_by(scan.no, isotopocule) %>%
     dplyr::slice(1L) %>%        # or dplyr::distinct(scan.no, isotopocule, .keep_all = TRUE)
     dplyr::ungroup()
   
-  # Your original block, now using df_nodups
+  # original block, now using df_nodups
   df_wide <- df_nodups %>%
     tidyr::pivot_wider(
       id_cols = scan.no,
@@ -195,12 +239,13 @@ process_one_injection <- function(filename, df, high_res_directory) {
   
   ruby_start_window <- which(df_wide$time.min>0 & df_wide$time.min<2)
   ruby_start <- df_wide$time.min[ruby_start_window[which.max(convolve_df$dtic_dT[ruby_start_window])]]
-  ruby_end_window <- which(df_wide$time.min>1 & df_wide$time.min<5)
+  ruby_end_window <- which(df_wide$time.min>2 & df_wide$time.min<6)
   ruby_end <- df_wide$time.min[ruby_end_window[which.min(convolve_df$dtic_dT[ruby_end_window])]]
   
   ruby_start_index <- which(convolve_df$time_min==ruby_start)
   ruby_end_index <- which(convolve_df$time_min==ruby_end)
-  trimmed_window <- which(convolve_df$dtic_dT[ruby_start_index:ruby_end_index]<5e6 & convolve_df$dtic_dT[ruby_start_index:ruby_end_index]>-5e6)
+  trimmed_window <- which(convolve_df$dtic_dT[ruby_start_index:ruby_end_index]<5e6 &
+                          convolve_df$dtic_dT[ruby_start_index:ruby_end_index]>-5e6)
   
   if (PEAK_DEFINITION_STRATEGY=='smoothed_derivative'){
     ruby_start <- min(convolve_df$time_min[ruby_start_index:ruby_end_index][trimmed_window])
@@ -215,7 +260,9 @@ process_one_injection <- function(filename, df, high_res_directory) {
     ruby_start <- SAMPLE_PEAK_START
     ruby_end <- SAMPLE_PEAK_END
   } else {
-    message(paste0("PEAK_DEFINITION_STRATEGY was entered as ", PEAK_DEFINITION_STRATEGY, " and is not recognized. Your options are 'smoothed_derivative', 'trimmed_median', 'combined', 'manual'"))
+    message(paste0("PEAK_DEFINITION_STRATEGY was entered as ",
+                   PEAK_DEFINITION_STRATEGY,
+                   " and is not recognized. Your options are 'smoothed_derivative', 'trimmed_median', 'combined', 'manual'"))
     knitr::knit_exit()
   }
     
@@ -271,25 +318,30 @@ process_one_injection <- function(filename, df, high_res_directory) {
     geom_vline(xintercept = ruby_start, linetype = "solid", color = "green", linewidth = 1) +
     geom_vline(xintercept = ruby_end,   linetype = "solid", color = "red",   linewidth = 1) +
     labs(title = "TIC vs time", x = "Time (minutes)", y = "TIC") +
-    scale_x_continuous(breaks = seq(0, 10, by = 1)) +
+    scale_x_continuous(breaks = seq(0, 13, by = 1)) +
     theme_minimal()
 
-  p2 <- ggplot() +
+  p2 <- ggplot(convolve_df) +
+    geom_line(aes(x = time_min, y = dtic_dT)) +
+    labs(title = "dtic_dT vs time", x = "Time (minutes)", y = "dTIC/dT") +
+    geom_vline(xintercept = ruby_start, linetype = "solid", color = "green", linewidth = 1) +
+    geom_vline(xintercept = ruby_end,   linetype = "solid", color = "red",   linewidth = 1) +
+    scale_x_continuous(breaks = seq(0, 13, by = 1)) +
+    theme_minimal()
+
+  p3 <- ggplot() +
     geom_line(data=df_wide, aes(x = time.min, y = oic), color="black", linewidth=2) +
     geom_line(data=df_clean, aes(x = time.min, y = oic), color="yellow", linewidth=1) +
     geom_vline(xintercept = ruby_start, linetype = "solid", color = "green", linewidth = 1) +
     geom_vline(xintercept = ruby_end,   linetype = "solid", color = "red",   linewidth = 1) +
     labs(title = oic_title, x = "Time (minutes)", y = "OIC") +
-    scale_x_continuous(breaks = seq(0, 10, by = 1)) +
+    scale_x_continuous(breaks=seq(0, 13, by=1), limits=c(0,ruby_end+1)) +
+    scale_y_continuous(
+      limits = c(min(df_clean$oic, na.rm = TRUE),
+                 max(df_clean$oic, na.rm = TRUE))
+    ) +
     theme_minimal()
 
-  p3 <- ggplot(convolve_df) +
-    geom_line(aes(x = time_min, y = dtic_dT)) +
-    labs(title = "dtic_dT vs time", x = "Time (minutes)", y = "dTIC/dT") +
-    geom_vline(xintercept = ruby_start, linetype = "solid", color = "green", linewidth = 1) +
-    geom_vline(xintercept = ruby_end,   linetype = "solid", color = "red",   linewidth = 1) +
-    scale_x_continuous(breaks = seq(0, 10, by = 1)) +
-    theme_minimal()
   
   png1 <- fs::path(high_res_directory, sprintf('%s_fig_%d.png', filename, 1))
   png2 <- fs::path(high_res_directory, sprintf('%s_fig_%d.png', filename, 2))
@@ -342,13 +394,13 @@ process_one_raw_file <- function(raw_file, high_res_directory) {
   isoraw              <- orbi_define_basepeak(isoraw, basepeak_def = "M0")
   isoraw              <- subset(isoraw, time.min > 0.2)
 
-  # main per-injection processing (your function)
-  res <- process_one_injection(filename, isoraw, high_res_directory)
+  # main per-injection processing
+  inj <- process_one_injection(filename, isoraw, high_res_directory)
 
-  # make M0/M1/M2 diagnostic scatter plots using res$scanlimits
+  # make M0/M1/M2 diagnostic scatter plots using inj$scanlimits
   peaks <- subset(
     raw_agg_file$peaks,
-    (scan.no > res$scanlimits[1]) & (scan.no < res$scanlimits[2])
+    (scan.no > inj$scanlimits[1]) & (scan.no < inj$scanlimits[2])
   )
 
   M0_limits <- c(96.930, 96.990)
@@ -363,7 +415,7 @@ process_one_raw_file <- function(raw_file, high_res_directory) {
 
   dir_create(high_res_directory, recurse = TRUE)
 
-  extra_pngs <- purrr::map_chr(plots_df, function(x) {
+  mz_zoomed_figs <- purrr::map_chr(plots_df, function(x) {
     p <- ggplot(x$df) +
       geom_point(aes(x = mzMeasured, y = intensity)) +
       labs(title = x$ttl, x = "mz Measured", y = "Intensity") +
@@ -374,6 +426,27 @@ process_one_raw_file <- function(raw_file, high_res_directory) {
     out
   })
 
+  full_mzRange <- fs::path(
+    high_res_directory,
+    sprintf("%s_fig_full_mzRange.png", filename)
+  )
+  
+  full_mzRange_fig <- ggplot() +
+    geom_vline(data=iso_df, aes(xintercept=mz), linetype="solid",color="gray", linewidth=0.5) +
+    geom_point(data=peaks, aes(x = mzMeasured, y = intensity), size = 0.3, alpha = 0.6) +
+    xlim(93, 105) +
+    ylim(0, 1e8) +
+    scale_x_continuous(breaks = seq(93, 105, by = 1)) +
+    labs(title = sprintf("%s — full m/z range", filename), x = "mz Measured", y = "Intensity") +
+    theme_minimal()
+  
+  # wider but same height as mz_zoomed_figs
+  ggsave(full_mzRange, full_mzRange_fig,
+         device = ragg::agg_png,
+         width  = 10,  # wider
+         height = 3,   # same height as mz_zoomed_figs
+         units  = "in",
+         dpi    = 100)
   
   ppm_tol <- 3  # 5 ppm tolerance
   
@@ -389,10 +462,12 @@ process_one_raw_file <- function(raw_file, high_res_directory) {
       n = n()
     ) %>%
     arrange(desc(peak_intensity))
-  res$largest_peaks <- head(peaks_clustered,10)
+  inj$largest_peaks <- head(peaks_clustered,20)
 
-  res$images <- c(res$images, extra_pngs)
-  res
+  
+  inj$images <- c(inj$images, mz_zoomed_figs)
+  inj$full_mzRange_image <- full_mzRange
+  inj
 } # end process_one_raw_file
 
 
@@ -429,22 +504,20 @@ find_nearest <- function(sample_order, reference_orders) {
 
 
 plot_temperature <- function(samples_data_frame){
-  Fig__AnalyzerT_vs_order <- ggplot() +
-  geom_errorbar(data = samples_data_frame,
-                mapping = aes(x = sample_order, 
+  Fig__AnalyzerT_vs_order <- ggplot(data = samples_data_frame) +
+  geom_errorbar(aes(x = sample_order, 
                               ymin = analyzerTmean - analyzerTsd*2, 
                               ymax = analyzerTmean + analyzerTsd*2, 
                               color = sample_name),
                   width = 0.2,  # Controls the width of error bars
                   linewidth = 1) +   
-  geom_point(data = samples_data_frame, 
-             mapping = aes(x = sample_order, y = analyzerTmean, color = sample_name), 
-             size = I(6)) +
-  geom_text(data = samples_data_frame,
-          mapping = aes(x = sample_order, 
-                        y = analyzerTmean,
-                        label = sample_order),
-          vjust = 0.5, hjust = 0.5, color = "black")+
+  geom_point(aes(x = sample_order, y = analyzerTmean,  shape=sample_name, fill=sample_name), size=6) +
+        scale_color_manual(values=color_values) +
+        scale_shape_manual(values=shape_values) +
+        scale_fill_manual(values=color_values) +
+  geom_text(aes(x = sample_order, y = analyzerTmean, label = sample_order), 
+                color = sapply(color_values[ruby_data_summary$sample_name], ideal_text_color),
+                size = 2.5, fontface = "bold", vjust = 0.35) +
   labs(
     title = paste0("Analyzer temperature vs sample order. Error bars are 2sd. Threshold = ", ABS_DELTA_T_THRESHOLD),
     x = "Sample order",
@@ -485,13 +558,23 @@ At the top of the .Rmd file, find the THINGS YOU MAY WANT TO CHANGE RUN TO RUN f
   - d33S_CALIBRATION_STANDARDS = `r d33S_CALIBRATION_STANDARDS`
   - d34S_CALIBRATION_STANDARDS = `r d34S_CALIBRATION_STANDARDS`
 
-  **Ideal Calibration Standards** - Agreed upon calibration standards as of 2025-05-22:
+  **Previous Ideal Calibration Standards** - Agreed upon calibration standards as of 2025-05-22:
 
 | Purpose     | d34S        | d17O & d18O |
 | ----------- | ----------- | ----------- |
 | calibration | S_MIF_2     | SodSul_6    | 
 | calibration | SodSul_4    | S_foxtrot   | 
 | check       | SodSul_2    | S_charlie   | 
+
+  **Updated Ideal Calibration Standards** - Agreed upon calibration standards as of 2025-10-27:
+
+| Purpose     | d34S        | d17O & d18O |
+| ----------- | ----------- | ----------- |
+| calibration | S_MIF_2     | SodSul_6    | 
+| calibration | SodSul_8    | S_delta     | 
+| check       | SodSul_4    | S_bravo     | 
+| check       | SodSul_2    |             | 
+
 
   **Samples to ignore**: `r SAMPLES_TO_IGNORE`
 
@@ -590,7 +673,7 @@ results <- furrr::future_map(
 ## --- unwrap: each_injection, rows, summary, errors ---
 named_results <- purrr::set_names(results, tools::file_path_sans_ext(basename(raw_files)))
 
-ok <- named_results |>
+each_injection <- named_results |>
   purrr::keep(~ is.null(.x$error)) |>
   purrr::map("result")
 
@@ -604,14 +687,58 @@ errs <- named_results |>
     )
   }) |>
   dplyr::bind_rows()
+```
 
-each_injection <- ok
-rows           <- purrr::map(ok, "row")
+```{r high-resolution-data-processing, echo=FALSE, include=FALSE}
+
+largest_peaks  <- purrr::map(each_injection, "largest_peaks")
+largest_peaks_tbl <- imap_dfr(
+  largest_peaks,
+  ~ mutate(.x, sample_id = .y)   # .y = name of the list element
+)
+
+largest_peaks_tbl <- largest_peaks_tbl %>%
+  mutate(
+    sample_order = as.integer(str_extract(sample_id, "\\d+$")),
+    sample_name  = str_remove(sample_id, "_\\d+$")
+  )
+
+readr::write_csv(largest_peaks_tbl, paste0(DATA_DIRECTORY, "/__Measured_Peaks__/", RUN_DIRECTORY, "_largest_peaks.csv"))
+
+
+rows           <- purrr::map(each_injection, "row")
 ruby_data_summary <- dplyr::bind_rows(rows)
 
 ```
 
-<details><summary class="expandable_subtitles">High Resolution Data</summary>
+<details><summary class="expandable_subtitles">High Resolution Summary</summary>
+
+```{r figure-style-setup, echo=FALSE, include=FALSE}
+
+all_levels <- levels(factor(ruby_data_summary$sample_name))
+
+# Split into standards and non-standards
+standards_present <- intersect(STANDARD_NAMES, all_levels)
+nonstandards_present <- setdiff(all_levels, standards_present)
+
+# Number of non-standard samples
+n_non <- length(nonstandards_present)
+
+# 1. Initialize vector for all samples
+color_values <- setNames(rep(NA, length(all_levels)), all_levels)
+
+# 2. Assign fixed colors to standards
+color_values[standards_present] <- STANDARD_COLORS[standards_present]
+
+# 3. Assign palette colors to non-standards
+if (n_non > 0) {
+  color_values[nonstandards_present] <- NONSTANDARD_PALETTE(n_non)
+}
+
+shape_values <- setNames(rep(16, length(all_levels)), all_levels)  # default circle
+shape_values[standards_present] <- STANDARD_SHAPES[standards_present]
+
+```
 
 ```{r high-res-summary-figures, fig.width=12, fig.height=8, fig.show='hold', echo=FALSE}
 knitr::opts_chunk$set(fig.show = "hold")
@@ -626,9 +753,13 @@ run_figures[[fig_n]] <- list(
     plot = ggplot(ruby_data_summary) + 
         geom_errorbar(aes(x = sample_order, ymin = TICmean - TICsd, ymax = TICmean + TICsd, color = sample_name),
                       width = 0.2, linewidth = 1) +
-        geom_point(aes(x=sample_order, y=TICmean, color = sample_name), size = I(5)) +
+        geom_point(aes(x=sample_order, y=TICmean, color=sample_name, shape=sample_name, fill=sample_name), size=6) +
+        scale_color_manual(values=color_values) +
+        scale_shape_manual(values=shape_values) +
+        scale_fill_manual(values=color_values) +
         geom_text(aes(x = sample_order, y = TICmean, label = sample_order), 
-            color = "black", size = 2.5, fontface = "bold", vjust = 0.35) +  
+                  color = sapply(color_values[ruby_data_summary$sample_name], ideal_text_color),
+                  size = 2.5, fontface = "bold", vjust = 0.35) +
         labs(title = title_text) +
         theme_minimal())
 print(run_figures[[fig_n]]$plot)
@@ -643,18 +774,85 @@ run_figures[[fig_n]] <- list(
     plot = ggplot(ruby_data_summary) + 
         geom_errorbar(aes(x = sample_order, ymin = OICmean - OICsd, ymax = OICmean + OICsd, color = sample_name),
                       width = 0.2, linewidth = 1) +
-        geom_point(aes(x=sample_order, y=OICmean, color = sample_name), size = I(5)) +
+        geom_point(aes(x=sample_order, y=OICmean, color = sample_name, shape=sample_name, fill=sample_name), size = 6) +
+        scale_color_manual(values=color_values) +
+        scale_shape_manual(values=shape_values) +
+        scale_fill_manual(values=color_values) +
         geom_text(aes(x = sample_order, y = OICmean, label = sample_order), 
-            color = "black", size = 2.5, fontface = "bold", vjust = 0.35) +  
+                  color = sapply(color_values[ruby_data_summary$sample_name], ideal_text_color),
+                  size = 2.5, fontface = "bold", vjust = 0.35) +  
         labs(title = title_text) +
         theme_minimal())
 print(run_figures[[fig_n]]$plot)
+
+
+
+# fig_n <- fig_n + 1
+
+
+# iso_tbl <- tibble::tibble(
+#   label = names(ISOTOPOCULES),
+#   mz    = as.numeric(ISOTOPOCULES)
+# )
+# x_right <- max(largest_peaks_tbl$sample_order) * 1.02
+# 
+# title_text =  sprintf("Figure %d - mz vs sample order", fig_n)
+# run_figures[[fig_n]] <- list(
+#     title_text =  title_text,
+#     anchor = sprintf("fig%d", fig_n),
+#     caption_text = "Measured m/z versus sample order",
+#     
+#     plot = ggplot(largest_peaks_tbl,
+#            aes(x = sample_order,
+#                y = mean_mz,
+#                size = 3,
+#                color = sample_name)) +
+#       geom_point(alpha = 0.7) +
+#       # scale_size_continuous(
+#       #   name = "Peak intensity",
+#       #   trans = "log10",
+#       #   range = c(1, 8)   # tweak as you like
+#       # ) +
+#       labs(
+#         x = "Sample order",
+#         y = "Mean m/z",
+#         color = "Sample name",
+#         title = "Largest peaks over time"
+#       ) +
+#       geom_hline(data = iso_tbl,
+#                  aes(yintercept = mz),
+#                  linetype = "dashed",
+#                  color = "gray40",
+#                  linewidth = 0.5) +
+#       geom_text(data = iso_tbl,
+#                 aes(x = x_right, y = mz, label = label),
+#                 hjust = -0.1, color = "gray20", size = 3) + 
+#       coord_cartesian(clip = "off") +
+#       theme_minimal())
+#   
+#     # plot = ggplot(ruby_data_summary) + 
+#     #     geom_errorbar(aes(x = sample_order, ymin = OICmean - OICsd, ymax = OICmean + OICsd, color = sample_name),
+#     #                   width = 0.2, linewidth = 1) +
+#     #     geom_point(aes(x=sample_order, y=OICmean, color = sample_name, shape=sample_name, fill=sample_name), size = 6) +
+#     #     scale_color_manual(values=color_values) +
+#     #     scale_shape_manual(values=shape_values) +
+#     #     scale_fill_manual(values=color_values) +
+#     #     geom_text(aes(x = sample_order, y = OICmean, label = sample_order), 
+#     #               color = sapply(color_values[ruby_data_summary$sample_name], ideal_text_color),
+#     #               size = 2.5, fontface = "bold", vjust = 0.35) +  
+#     #     labs(title = title_text) +
+#     #     theme_minimal())
+# print(run_figures[[fig_n]]$plot)
 ```
+
+</details>
+
+<details><summary class="expandable_subtitles">High Resolution Individual Injections</summary>
+
 
 ```{r emit-sample-sections, results='asis', comment=NA, echo=FALSE, message=FALSE, warning=FALSE}
 for (rec in each_injection) {
   cat(sprintf('<details class="high_res_sample"><summary>%s</summary>\n', rec$filename))
-  cat(sprintf('Ten largest peaks: %s\n', rec$top10peaks))
   cat('<div style="display:flex; gap:0.5rem; flex-wrap:wrap;">\n')
   for (img in rec$images) {
     cat(sprintf(
@@ -662,11 +860,12 @@ for (rec in each_injection) {
       img
     ))
   }
+  cat(sprintf('<img src="%s" style="max-width:100%%; height:auto;">\n', rec$full_mzRange_image))
   cat('</div>\n')
   
   if (!is.null(rec$largest_peaks) && nrow(rec$largest_peaks) > 0) {
 
-    cat('<div class="section-indent">Ten largest peaks: <table style="border-collapse:collapse; margin-top:1rem;">\n')
+    cat('<div class="section-indent">Twenty largest peaks: <table style="border-collapse:collapse; margin-top:1rem;">\n')
     cat('<tr>',
         '<th style="border:1px solid #ccc; padding:4px;">Mean m/z</th>',
         '<th style="border:1px solid #ccc; padding:4px;">Mean Intensity</th>',
@@ -679,10 +878,6 @@ for (rec in each_injection) {
     }
     cat('</table></div>\n')
   }
-  
-  
-  
-  
   
   cat('</details>\n\n')
 }
@@ -796,65 +991,60 @@ message('\n ===== data frame output:  analyses  =====')
 ```{r visualize-bracketing-references, echo=FALSE, fig.width=10, fig.height=6}
 
 Fig__R34S_vs_order <- ggplot() +
-geom_point(data = bracketing_references,
-              mapping = aes(x = sample_order, 
-                            y = R34S, 
-                            color = sample_name)) +   
-geom_point(data = analyses, 
-              mapping = aes(x = sample_order,
-                            y = R34S,
-                            color = sample_name), 
-           size = I(6)) +
-geom_text(data = analyses,
-        mapping = aes(x = sample_order, 
-                      y = R34S,
-                      label = sample_order),
-        vjust = 0.5, hjust = 0.5, color = "black")+
-labs(
-  title = paste0("R34S vs sample order."),
-  x = "Sample order",
-  y = "R34S") +
-theme_minimal() +
-theme(
-  axis.line = element_line(color = "black", linewidth = 1),
-  panel.border = element_rect(color = "black", fill = NA, linewidth = 1),
-  legend.position = "right",  # Places legend outside the plot
-  legend.text = element_text(size = 14),  # Increase legend font size
-  plot.title = element_text(size = 16, face = "bold"),  # Adjust title size
-  axis.title = element_text(size = 14),  # Adjust axis labels
-  axis.text = element_text(size = 12)  # Adjust axis text
-)
+  geom_point(data = bracketing_references,
+             mapping = aes(x=sample_order, y=R34S), color="black", shape=22, fill="green", size = 6) +
+  geom_text(data = bracketing_references,
+            mapping = aes(x=sample_order, y=R34S, label=sample_order), 
+            color = "black", size = 2.5, fontface = "bold", vjust = 0.35) +
+  geom_point(data = analyses,
+             mapping = aes(x=sample_order, y=R34S, color=sample_name, shape=sample_name, fill=sample_name), size=6) +
+  scale_color_manual(values=color_values) +
+  scale_shape_manual(values=shape_values) +
+  scale_fill_manual(values=color_values) +
+  geom_text(data = analyses,
+            mapping = aes(x = sample_order, y = R34S, label = sample_order), 
+            color = "white",
+            size = 2.5, fontface = "bold", vjust = 0.35) +
+  labs(
+    title = "R34S vs sample order.",
+    x = "Sample order",
+    y = "R34S"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.line = element_line(color = "black", linewidth = 1),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 1),
+    legend.position = "right",
+    legend.text = element_text(size = 14),
+    plot.title = element_text(size = 16, face = "bold"),
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 12)
+  )
 print(Fig__R34S_vs_order)
 
+
 Fig__R34Sref_vs_order <- ggplot() +
-geom_point(data = bracketing_references,
-              mapping = aes(x = sample_order, 
-                            y = R34S, 
-                            color = sample_name)) +   
-geom_point(data = analyses, 
-              mapping = aes(x = sample_order,
-                            y = R34S_ref,
-                            color = sample_name), 
-           size = I(6)) +
-geom_text(data = analyses,
-        mapping = aes(x = sample_order, 
-                      y = R34S_ref,
-                      label = sample_order),
-        vjust = 0.5, hjust = 0.5, color = "black")+
-labs(
-  title = paste0("Bracketing references R34S vs sample order."),
-  x = "Sample order",
-  y = "Bracketing reference R34S") +
-theme_minimal() +
-theme(
-  axis.line = element_line(color = "black", linewidth = 1),
-  panel.border = element_rect(color = "black", fill = NA, linewidth = 1),
-  legend.position = "right",  # Places legend outside the plot
-  legend.text = element_text(size = 14),  # Increase legend font size
-  plot.title = element_text(size = 16, face = "bold"),  # Adjust title size
-  axis.title = element_text(size = 14),  # Adjust axis labels
-  axis.text = element_text(size = 12)  # Adjust axis text
-)
+  geom_point(data = bracketing_references,
+             mapping = aes(x = sample_order, y = R34S), color="black", size=3, fill="green", shape=21) +
+  geom_point(data = analyses, 
+             mapping = aes(x = sample_order, y = R34S_ref, color = sample_name), size = 6) +
+  geom_text(data = analyses,
+            mapping = aes(x = sample_order, y = R34S_ref, label = sample_order),
+            vjust = 0.5, hjust = 0.5, color = "black")+
+  labs(
+    title = paste0("Bracketing references R34S vs sample order."),
+    x = "Sample order",
+    y = "Bracketing reference R34S") +
+  theme_minimal() +
+  theme(
+    axis.line = element_line(color = "black", linewidth = 1),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 1),
+    legend.position = "right",  # Places legend outside the plot
+    legend.text = element_text(size = 14),  # Increase legend font size
+    plot.title = element_text(size = 16, face = "bold"),  # Adjust title size
+    axis.title = element_text(size = 14),  # Adjust axis labels
+    axis.text = element_text(size = 12)  # Adjust axis text
+  )
 print(Fig__R34Sref_vs_order)
 
 Fig__R34Sref_vs_AnalyzerT <- ggplot() +
