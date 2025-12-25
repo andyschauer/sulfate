@@ -1630,6 +1630,7 @@ knitr::kable(reference_materials, format = "html", caption = caption_text,
 - 2025-11-18 => SAMPLES_TO_IGNORE works again, it was dead after moving to raw files; 
 - 2025-11-20 => moved analyses export to csv up next to vial level export
 - 2025-12-05 => fix bug in where csv files were being saved
+- 2025-12-25 => moved to git and github, merged Drew's version, merged Andy's version, saved as sulfate.Rmd, added this comment to practice branching, merging, and all the git things
 </details>
 
 ```{r, save-workspace, echo=FALSE, include=FALSE}
