@@ -102,7 +102,8 @@ Pull
 
 	On your local machine:
 
-	# from inside the repo, with main up to date
+	from inside the repo, with main up to date:
+
 		git checkout -b feature-xyz
 
 	feature-xyz is any name you choose that describes the work
@@ -117,12 +118,14 @@ Pull
 
 	On your local machine:
 
-	# edit files in RStudio / Sublime / etc.
+	edit files in RStudio / Sublime / etc.
 
 		git status                   # see what changed
 		git add sulfate.Rmd          # or specific files
-	# or to add everything you changed:
-	# git add .
+	
+	or to add everything you changed:
+		
+		git add .
 
 		git commit -m "Describe what you changed"
 
