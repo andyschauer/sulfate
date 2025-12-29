@@ -1474,6 +1474,15 @@ knitr::kable(reference_materials, format = "html", caption = caption_text,
 
 </details>
 
+<details><summary class="expandable_subtitles">Acknowledgements</summary>
+This package builds on the excellent ecosystem of open-source tools, especially:
+
+- [`isoorbi`](https://github.com/isoorbi/isoorbi) – Orbitrap data processing foundations  
+- [`dplyr`](https://dplyr.tidyverse.org/) – data manipulation  
+- [`ggplot2`](https://ggplot2.tidyverse.org/) – visualization  
+- [`jsonlite`](https://github.com/jeroen/jsonlite) – JSON handling  
+</details>
+
 <details><summary class="expandable_subtitles">Script Change Log</summary>
 
 - 2024-09-16 => Saved from v240912_0918 as Becky's original filename (CalculateDeltas.R) for simplicity.
@@ -1500,7 +1509,7 @@ knitr::kable(reference_materials, format = "html", caption = caption_text,
 - 2025-11-20 => moved analyses export to csv up next to vial level export
 - 2025-12-05 => fix bug in where csv files were being saved
 - 2025-12-25 => moved to git and github, merged Drew's version, merged Andy's version, saved as sulfate.Rmd, added this comment to practice branching, merging, and all the git things
-- 2025-12-27 => cleanup, standardized figures, removed old content
+- 2025-12-27 => minor cleanup, standardized figures, removed old content
 </details>
 
 ```{r, save-workspace, echo=FALSE, include=FALSE}
