@@ -1474,6 +1474,15 @@ knitr::kable(reference_materials, format = "html", caption = caption_text,
 
 </details>
 
+<details><summary class="expandable_subtitles">Acknowledgements</summary>
+This package builds on the excellent ecosystem of open-source tools, especially:
+
+- [`isoorbi`](https://github.com/isoorbi/isoorbi) – Orbitrap data processing foundations  
+- [`dplyr`](https://dplyr.tidyverse.org/) – data manipulation  
+- [`ggplot2`](https://ggplot2.tidyverse.org/) – visualization  
+- [`jsonlite`](https://github.com/jeroen/jsonlite) – JSON handling  
+</details>
+
 <details><summary class="expandable_subtitles">Script Change Log</summary>
 
 - 2024-09-16 => Saved from v240912_0918 as Becky's original filename (CalculateDeltas.R) for simplicity.
