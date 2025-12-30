@@ -94,20 +94,9 @@ RAW_DIRECTORY <- "wM0"
 ISOX_DIRECTORY <- "wM0"
 ISOX_FILENAME <- "combined.isox"
 
-ISOTOPOCULES <- c("M0"=96.96010,
-                  "33S"=97.95949,
-                  "17O"=97.96432,
-                  "34S"=98.95590,
-                  "18O"=98.96435)
-
-iso_df <- data.frame(
-  label = names(ISOTOPOCULES),
-  mz    = as.numeric(ISOTOPOCULES)
-)
-
 REFERENCE_MATERIALS_FILE <- "/home/disk/melvin/OrbiData/reference_materials/reference_materials.json"
 
-SAMPLES_TO_IGNORE <- c()          # if a particular sample is bad, enter its filename with quotes around it here, e.g. 'SodSul-2-ref_5'
+SAMPLES_TO_IGNORE <- c('SodSul-8_22', 'S-MIF-2_52', 'S-delta_72', 'S-bravo_50')          # if a particular sample is bad, enter its filename with quotes around it here, e.g. 'SodSul-2-ref_5'
 
 WEAK_ISOTOPOCULE_THRESHOLD <- 10  # filter out weak isotopocules that are present in this percentage of scans or lower, e.g. if 17O18O is present in <10% of scans, filter them all out
 
@@ -382,14 +371,15 @@ process_one_raw_file <- function(raw_file, high_res_directory) {
     (scan.no > inj$scanlimits[1]) & (scan.no < inj$scanlimits[2])
   )
 
-  M0_limits <- c(96.930, 96.990)
-  M1_limits <- c(97.930, 97.990)
-  M2_limits <- c(98.930, 98.990)
+  limit_offset <- 0.020
+  M0_limits <- c(ISOTOPOCULES['M0']-limit_offset, ISOTOPOCULES['M0']+limit_offset)
+  M1_limits <- c(ISOTOPOCULES['33S']-limit_offset, ISOTOPOCULES['33S']+limit_offset)
+  M2_limits <- c(ISOTOPOCULES['34S']-limit_offset, ISOTOPOCULES['34S']+limit_offset)
 
   plots_df <- list(
     list(df = peaks[peaks$mzMeasured > M0_limits[1] & peaks$mzMeasured < M0_limits[2], ], ttl = "M0", lims = M0_limits, idx = 4),
-    list(df = peaks[peaks$mzMeasured > M1_limits[1] & peaks$mzMeasured < M1_limits[2], ], ttl = "M1", lims = M1_limits, idx = 5),
-    list(df = peaks[peaks$mzMeasured > M2_limits[1] & peaks$mzMeasured < M2_limits[2], ], ttl = "M2", lims = M2_limits, idx = 6)
+    list(df = peaks[peaks$mzMeasured > M1_limits[1] & peaks$mzMeasured < M1_limits[2], ], ttl = "M1 - 33S and 17O", lims = M1_limits, idx = 5),
+    list(df = peaks[peaks$mzMeasured > M2_limits[1] & peaks$mzMeasured < M2_limits[2], ], ttl = "M2 - 34S and 18O", lims = M2_limits, idx = 6)
   )
 
   dir_create(high_res_directory, recurse = TRUE)
@@ -410,12 +400,15 @@ process_one_raw_file <- function(raw_file, high_res_directory) {
     sprintf("%s_fig_full_mzRange.png", filename)
   )
   
+  xlim_min <- min(ISOTOPOCULES)-2
+  xlim_max <- max(ISOTOPOCULES)+2
+
   full_mzRange_fig <- ggplot() +
     geom_vline(data=iso_df, aes(xintercept=mz), linetype="solid",color="gray", linewidth=0.5) +
     geom_point(data=peaks, aes(x = mzMeasured, y = intensity), size = 0.3, alpha = 0.6) +
-    xlim(93, 105) +
+    xlim(xlim_min, xlim_max) +
     ylim(0, 1e8) +
-    scale_x_continuous(breaks = seq(93, 105, by = 1)) +
+    scale_x_continuous(breaks = seq(xlim_min, xlim_max, by = 1)) +
     labs(title = sprintf("%s — full m/z range", filename), x = "mz Measured", y = "Intensity") +
     theme_minimal()
   
@@ -605,6 +598,30 @@ sample_order <- as.integer(sub(".*_(\\d+)\\.raw$", "\\1", raw_files))
 raw_files <- raw_files[order(sample_order)]
 
 
+# decide based on first raw file if we have measured SO3 or HSO4
+raw_agg_file <- raw_files[1] |> orbi_read_raw(include_spectra = FALSE) |> orbi_aggregate_raw()
+if (raw_agg_file$file_info$LowMass<80){
+  # SO3
+  ISOTOPOCULES <- c("M0"=79.95736,
+                    "33S"=80.95675,
+                    "17O"=80.96158,
+                    "34S"=81.95316,
+                    "18O"=81.96161)
+} else if (raw_agg_file$file_info$LowMass>90){
+#  HSO4
+  ISOTOPOCULES <- c("M0"=96.96010,
+                    "33S"=97.95949,
+                    "17O"=97.96432,
+                    "34S"=98.95590,
+                    "18O"=98.96435)
+
+}
+iso_df <- data.frame(
+  label = names(ISOTOPOCULES),
+  mz    = as.numeric(ISOTOPOCULES)
+)
+
+
 each_injection <- list()
 rows <- list()
 
@@ -661,6 +678,14 @@ readr::write_csv(largest_peaks_tbl, paste0(DATA_DIRECTORY, "/__Measured_Peaks__/
 
 rows           <- purrr::map(each_injection, "row")
 ruby_data_summary <- dplyr::bind_rows(rows)
+
+for (i in seq_along(each_injection)) {
+  rec <- each_injection[[i]]
+  if (!is.null(rec$largest_peaks) && nrow(rec$largest_peaks) > 0) {
+    first_intensity <- rec$largest_peaks$peak_intensity[1]
+    ruby_data_summary$first_peak_intensity[i] <- first_intensity
+    }
+  }
 ```
 
 ```{r determine-standards-present, echo=FALSE, include=FALSE}
@@ -779,46 +804,65 @@ print(run_figures[[fig_n]]$plot)
 
 
 ```{r emit-sample-sections, results='asis', comment=NA, echo=FALSE, message=FALSE, warning=FALSE}
+
+
+
+
 for (rec in each_injection) {
   cat(sprintf('<details class="high_res_sample"><summary>%s</summary>\n', rec$filename))
-  cat('<div style="display:flex; gap:0.5rem; flex-wrap:wrap;">\n')
+
+  # --- Row 1: small zoomed images -----------------------------------------
+  cat('<div style="display:flex; gap:0.5rem; flex-wrap:wrap; margin-bottom:0.5rem;">\n')
   for (img in rec$images) {
     cat(sprintf(
       '<img src="%s" style="max-width:30%%; height:auto;">\n',
       img
     ))
   }
-  cat(sprintf('<img src="%s" style="max-width:100%%; height:auto;">\n', rec$full_mzRange_image))
   cat('</div>\n')
-  
-  if (!is.null(rec$largest_peaks) && nrow(rec$largest_peaks) > 0) {
- 
-    for (i in seq_along(each_injection)) {
-  rec <- each_injection[[i]]   
-    # Save largest peak intensity back into analyses ----
-if (!is.null(rec$largest_peaks) && nrow(rec$largest_peaks) > 0) {
-    # extract first peak intensity
-    first_intensity <- rec$largest_peaks$peak_intensity[1]
 
-    # save into the SAME row of analyses
-    ruby_data_summary$first_peak_intensity[i] <- first_intensity
-  }}
-    cat('<div class="section-indent">Ten largest peaks: <table style="border-collapse:collapse; margin-top:1rem;">\n')
+  # --- Row 2: full-range image + Ten largest peaks table side-by-side -----
+  if (!is.null(rec$full_mzRange_image) && !is.null(rec$largest_peaks) && nrow(rec$largest_peaks) > 0) {
+
+    # flex container for image + table
+    cat('<div style="display:flex; gap:1rem; align-items:flex-start; margin-bottom:0.5rem;">\n')
+
+    # left: full-range image (~70% of width)
+    cat(sprintf(
+      '<div style="flex:0 0 70%%;"><img src="%s" style="width:100%%; height:auto;"></div>\n',
+      rec$full_mzRange_image
+    ))
+
+    # right: table (~30% of width)
+    cat('<div style="flex:1;">Ten largest peaks:',
+    '<table style="border-collapse:collapse; margin-top:0.5rem;">\n')
     cat('<tr>',
-        '<th style="border:1px solid #ccc; padding:4px;">Mean m/z</th>',
-        '<th style="border:1px solid #ccc; padding:4px;">Mean Intensity</th>',
-        '</tr>\n')
+    '<th style="border:1px solid #ccc; padding:4px;">Mean m/z</th>',
+    '<th style="border:1px solid #ccc; padding:4px;">Mean Intensity</th>',
+    '</tr>\n')
     for (i in seq_len(nrow(rec$largest_peaks))) {
       cat('<tr>',
-          sprintf('<td style="border:1px solid #ccc; padding:4px;">%.4f</td>', rec$largest_peaks$mean_mz[i]),
-          sprintf('<td style="border:1px solid #ccc; padding:4px;">%.0f</td>', rec$largest_peaks$peak_intensity[i]),
-          '</tr>\n')
+      sprintf('<td style="border:1px solid #ccc; padding:4px;">%.4f</td>',
+      rec$largest_peaks$mean_mz[i]),
+      sprintf('<td style="border:1px solid #ccc; padding:4px;">%.0f</td>',
+      rec$largest_peaks$peak_intensity[i]),
+      '</tr>\n')
     }
-    cat('</table></div>\n')
+    cat('</table></div>\n')  # close right-side div
+    cat('</div>\n')         # close flex container
+  } else {
+    # if you still want to show the full image even when no table:
+    if (!is.null(rec$full_mzRange_image)) {
+      cat(sprintf(
+        '<img src="%s" style="max-width:100%%; height:auto; margin-bottom:0.5rem;">\n',
+        rec$full_mzRange_image
+        ))
+      }
   }
-  
+
   cat('</details>\n\n')
 }
+
 ```
 
 </details>
@@ -1346,9 +1390,19 @@ residuals <- analyses %>%
   mutate(across(c(d34S, d18O, d17O, d33S), ~ . - mean(. , na.rm = TRUE), .names = "{.col}_residual")) %>%
   ungroup()
 
-d34S_title <- paste0("d34S residual 2-sigma = ", round(sd(residuals$d34S_residual)*2,2))
+d34S_precision <- round(sd(residuals$d34S_residual, na.rm = TRUE) * 2, 2)
+d18O_precision <- round(sd(residuals$d18O_residual, na.rm = TRUE) * 2, 2)
+d34S_outlier <- round(sd(residuals$d34S_residual, na.rm = TRUE) * 3.3, 2)
+d18O_outlier <- round(sd(residuals$d18O_residual, na.rm = TRUE) * 3.3, 2)
+
+
+d34S_title <- paste0("d34S residual 2-sigma = ", d34S_precision, " permil; (yellow = 95%; red = 99.9%)")
 Fig_d34Sresidual_vs_order <- ggplot(residuals) + 
       geom_point(aes(x=sample_order, y=d34S_residual, shape=sample_name, fill=sample_name), size=6) +
+      geom_hline(yintercept = d34S_precision,   linetype = "solid", color = "yellow",   linewidth = 0.5) +
+      geom_hline(yintercept = -d34S_precision,   linetype = "solid", color = "yellow",   linewidth = 0.5) +
+      geom_hline(yintercept = d34S_outlier,   linetype = "solid", color = "red",   linewidth = 0.5) +
+      geom_hline(yintercept = -d34S_outlier,   linetype = "solid", color = "red",   linewidth = 0.5) +
       scale_color_manual(values=color_values) +
       scale_shape_manual(values=shape_values) +
       scale_fill_manual(values=color_values) +
@@ -1399,6 +1453,10 @@ Fig_d34Sresidual_vs_name <- ggplot() +
   # ---- Points ----
   geom_point(data = residuals_flagged,
              aes(x = sample_name, y = d34S_residual, shape=sample_name, fill=sample_name), size=6) +
+  geom_hline(yintercept = d34S_precision,   linetype = "solid", color = "yellow",   linewidth = 0.5) +
+  geom_hline(yintercept = -d34S_precision,   linetype = "solid", color = "yellow",   linewidth = 0.5) +
+  geom_hline(yintercept = d34S_outlier,   linetype = "solid", color = "red",   linewidth = 0.5) +
+  geom_hline(yintercept = -d34S_outlier,   linetype = "solid", color = "red",   linewidth = 0.5) +
   scale_color_manual(values=color_values) +
   scale_shape_manual(values=shape_values) +
   scale_fill_manual(values=color_values) +
@@ -1414,20 +1472,24 @@ print(Fig_d34Sresidual_vs_name)
 
 
 
-Fig_d34Sresidual_vs_TIC <- ggplot() + 
-      geom_point(data=residuals, mapping=aes(x=TICmean, y=d34S_residual, shape=sample_name, fill=sample_name), size=6) +
-      scale_color_manual(values=color_values) +
-      scale_shape_manual(values=shape_values) +
-      scale_fill_manual(values=color_values) +
-      geom_label_order(residuals, aes(x = TICmean, y = d34S_residual, label = sample_order)) +
-      labs(title = d34S_title, x = "Mean TIC", y = "d34S residual (permil)", color = "Sample Name")
-print(Fig_d34Sresidual_vs_TIC)
+# Fig_d34Sresidual_vs_TIC <- ggplot() + 
+#       geom_point(data=residuals, mapping=aes(x=TICmean, y=d34S_residual, shape=sample_name, fill=sample_name), size=6) +
+#       scale_color_manual(values=color_values) +
+#       scale_shape_manual(values=shape_values) +
+#       scale_fill_manual(values=color_values) +
+#       geom_label_order(residuals, aes(x = TICmean, y = d34S_residual, label = sample_order)) +
+#       labs(title = d34S_title, x = "Mean TIC", y = "d34S residual (permil)", color = "Sample Name")
+# print(Fig_d34Sresidual_vs_TIC)
 
 
 
-d18O_title <- paste0("d18O residual 2-sigma = ", round(sd(residuals$d18O_residual)*2,2))
+d18O_title <- paste0("d18O residual 2-sigma = ", d18O_precision, " permil; (yellow = 95%; red = 99.9%)")
 Fig_d18Oresidual_vs_order <- ggplot() + 
       geom_point(data=residuals, mapping=aes(x=sample_order, y=d18O_residual, shape=sample_name, fill=sample_name), size=6) +
+      geom_hline(yintercept = d18O_precision,   linetype = "solid", color = "yellow",   linewidth = 0.5) +
+      geom_hline(yintercept = -d18O_precision,   linetype = "solid", color = "yellow",   linewidth = 0.5) +
+      geom_hline(yintercept = d18O_outlier,   linetype = "solid", color = "red",   linewidth = 0.5) +
+      geom_hline(yintercept = -d18O_outlier,   linetype = "solid", color = "red",   linewidth = 0.5) +
       scale_color_manual(values=color_values) +
       scale_shape_manual(values=shape_values) +
       scale_fill_manual(values=color_values) +
@@ -1510,6 +1572,7 @@ This package builds on the excellent ecosystem of open-source tools, especially:
 - 2025-12-05 => fix bug in where csv files were being saved
 - 2025-12-25 => moved to git and github, merged Drew's version, merged Andy's version, saved as sulfate.Rmd, added this comment to practice branching, merging, and all the git things
 - 2025-12-27 => minor cleanup, standardized figures, removed old content
+- 2025-12-30 => trying to make sulfate.Rmd handle both HSO4 and SO3; the first raw file is read in and the LowMass is used to decide if we measured HSO4 or SO3; added precision and outlier horizontal lines to residual figures 
 </details>
 
 ```{r, save-workspace, echo=FALSE, include=FALSE}
