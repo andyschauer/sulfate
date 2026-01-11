@@ -88,19 +88,8 @@ library(zoo)
 ```{r Initialization, echo=FALSE, include=FALSE}
 # -------------------- THINGS YOU MAY WANT TO CHANGE RUN-TO-RUN --------------------
 
-DATA_DIRECTORY <- "/home/disk/melvin/OrbiData/Ruby"
-RUN_DIRECTORY <- basename(getwd())
-RAW_DIRECTORY <- "wM0"
-ISOX_DIRECTORY <- "wM0"
-ISOX_FILENAME <- "combined.isox"
-
-REFERENCE_MATERIALS_FILE <- "/home/disk/melvin/OrbiData/reference_materials/reference_materials.json"
-
-SAMPLES_TO_IGNORE <- c('SodSul-8_22', 'S-MIF-2_52', 'S-delta_72', 'S-bravo_50')          # if a particular sample is bad, enter its filename with quotes around it here, e.g. 'SodSul-2-ref_5'
-
-WEAK_ISOTOPOCULE_THRESHOLD <- 10  # filter out weak isotopocules that are present in this percentage of scans or lower, e.g. if 17O18O is present in <10% of scans, filter them all out
-
-AGC_FOLD_THRESHOLD <- 4           # if a scan has this multiple greater than or less than the average number of ions in the orbitrap, they are filtered out
+wM0_SAMPLES_TO_IGNORE <- c()          # if a particular sample is bad, enter its filename with quotes around it here, e.g. 'SodSul-2-ref_5'
+noM0_SAMPLES_TO_IGNORE <- c()
 
 ABS_DELTA_T_THRESHOLD <- 0.1      # Set threshold of sample vs standard temperature difference for flagging data
 
@@ -112,6 +101,8 @@ d34S_CALIBRATION_STANDARDS <- c('SodSul_8', 'S_MIF_2')
 PEAK_DEFINITION_STRATEGY <- 'combined'                   # options are:  'smoothed_derivative', 'trimmed_median', 'combined', 'manual'
 SAMPLE_PEAK_START <- 1.0
 SAMPLE_PEAK_END <-4.0
+
+run_this <- FALSE
 ```
 
 
@@ -159,6 +150,11 @@ geom_label_order <- function(data, mapping) {
   )
 }
 
+log_line <- function(...) {
+  cat(format(Sys.time(), "%F %T"), " | ", ..., "\n",
+      file = logfile, append = TRUE, sep = "")
+}
+
 
 process_one_injection <- function(filename, df, high_res_directory) {
   df_to_be_joined <- df %>%
@@ -195,6 +191,10 @@ process_one_injection <- function(filename, df, high_res_directory) {
     ) %>%
     dplyr::left_join(df_to_be_joined, by = "scan.no")
   
+
+  needed <- c("R34S","R33S","R17O","R18O")
+  for (nm in needed) if (!nm %in% names(df_wide)) df_wide[[nm]] <- NA_real_
+
   
   # ------- Define Injection Peak -------
   smoothing_window <- 20
@@ -237,9 +237,10 @@ process_one_injection <- function(filename, df, high_res_directory) {
     knitr::knit_exit()
   }
     
-  df_clean <- subset(df_wide, !is.na(R34S) &
-                     (is.na(ruby_start) | time.min > ruby_start) &
-                     (is.na(ruby_end)   | time.min < ruby_end))
+  df_clean <- df_wide |> dplyr::filter(
+                                       (is.na(ruby_start) | time.min > ruby_start),
+                                       (is.na(ruby_end)   | time.min < ruby_end))
+
   if (PEAK_DEFINITION_STRATEGY=='trimmed_median' || PEAK_DEFINITION_STRATEGY=='combined'){
     median_tic <- median(df_clean$tic)
     df_clean <- subset(df_clean, tic/median_tic>0.8 & tic/median_tic<1.2)
@@ -257,7 +258,7 @@ process_one_injection <- function(filename, df, high_res_directory) {
 
   injection_summary <- df_clean %>%
     dplyr::summarize(
-      run = !!RUN_DIRECTORY,
+      run = !!run_name,
       sample_name = dplyr::first(sample_name),
       sample_order = dplyr::first(sample_order),
       ruby_start = !!ruby_start,
@@ -329,7 +330,7 @@ process_one_injection <- function(filename, df, high_res_directory) {
 } # end process_one_injection
 
 
-process_one_raw_file <- function(raw_file, high_res_directory) {
+process_one_raw_file <- function(raw_file, high_res_directory, basepeak) {
   filename <- tools::file_path_sans_ext(basename(raw_file))
 
   raw_agg_file <- raw_file |>
@@ -359,7 +360,7 @@ process_one_raw_file <- function(raw_file, high_res_directory) {
   isoraw$sample_name  <- gsub("-", "_", sub("_.*", "", isoraw$filename))
   isoraw$sample_order <- as.numeric(sub(".*_", "", isoraw$filename))
   isoraw$oic          <- isoraw$tic * isoraw$it.ms / 1000
-  isoraw              <- orbi_define_basepeak(isoraw, basepeak_def = "M0")
+  isoraw              <- orbi_define_basepeak(isoraw, basepeak_def = basepeak)
   isoraw              <- subset(isoraw, time.min > 0.2)
 
   # main per-injection processing
@@ -382,7 +383,7 @@ process_one_raw_file <- function(raw_file, high_res_directory) {
     list(df = peaks[peaks$mzMeasured > M2_limits[1] & peaks$mzMeasured < M2_limits[2], ], ttl = "M2 - 34S and 18O", lims = M2_limits, idx = 6)
   )
 
-  dir_create(high_res_directory, recurse = TRUE)
+  # dir_create(HIGH_RES_DIRECTORY, recurse = TRUE)
 
   mz_zoomed_figs <- purrr::map_chr(plots_df, function(x) {
     p <- ggplot(x$df) +
@@ -467,7 +468,7 @@ find_nearest <- function(sample_order, reference_orders) {
 }
 
 
-plot_temperature <- function(samples_data_frame){
+plot_temperature <- function(samples_data_frame, xM0){
   Fig__AnalyzerT_vs_order <- ggplot(data = samples_data_frame) +
   geom_errorbar(aes(x = sample_order, 
                     ymin = analyzerTmean - analyzerTsd*2, 
@@ -481,7 +482,7 @@ plot_temperature <- function(samples_data_frame){
         scale_fill_manual(values=color_values) +
   geom_label_order(samples_data_frame, aes(x = sample_order, y = analyzerTmean, label = sample_order)) +
   labs(
-    title = paste0("Analyzer temperature vs sample order. Error bars are 2sd. Threshold = ", ABS_DELTA_T_THRESHOLD),
+    title = paste0(xM0, " - Analyzer temperature vs sample order. Error bars are 2sd. Threshold = ", ABS_DELTA_T_THRESHOLD),
     x = "Sample order",
     y = "Mean Analyzer Temp (*C)")
   print(Fig__AnalyzerT_vs_order)
@@ -500,8 +501,6 @@ At the top of the .Rmd file, find the THINGS YOU MAY WANT TO CHANGE RUN TO RUN f
   **Thresholds**:
   
   - ABS_DELTA_T_THRESHOLD = `r ABS_DELTA_T_THRESHOLD`
-  - WEAK_ISOTOPOCULE_THRESHOLD = `r WEAK_ISOTOPOCULE_THRESHOLD`
-  - AGC_FOLD_THRESHOLD = `r AGC_FOLD_THRESHOLD`
 
   **Chosen Calibration Standards**:
 
@@ -528,7 +527,8 @@ At the top of the .Rmd file, find the THINGS YOU MAY WANT TO CHANGE RUN TO RUN f
 | check       | SodSul_2    |             | 
 
 
-  **Samples to ignore**: `r SAMPLES_TO_IGNORE`
+  **wM0 Samples to ignore**: `r wM0_SAMPLES_TO_IGNORE`
+  **noM0 Samples to ignore**: `r noM0_SAMPLES_TO_IGNORE`
 
   **Sample Peak Definition**:
 
@@ -545,15 +545,37 @@ At the top of the .Rmd file, find the THINGS YOU MAY WANT TO CHANGE RUN TO RUN f
 
 ```{r file-and-directory-setup, echo=FALSE, include=FALSE}
 
-isox_full_path <- file.path(DATA_DIRECTORY, RUN_DIRECTORY, ISOX_DIRECTORY, ISOX_FILENAME)
+DATA_DIRECTORY              <-    "/home/disk/melvin/OrbiData/Ruby"
+REFERENCE_MATERIALS_FILE    <-    "/home/disk/melvin/OrbiData/reference_materials/reference_materials.json"
 
-high_res_directory <- "high_res/"
-if (!dir.exists(high_res_directory)) {
-  dir.create(high_res_directory, recursive = TRUE)
-  message("Directory created: ", high_res_directory)
-} else {
-  message("Directory already exists: ", high_res_directory)
+run_name                    <-    basename(getwd())
+wM0_HIGH_RES_DIRECTORY      <-    file.path(DATA_DIRECTORY, run_name, "wM0_high_res")
+noM0_HIGH_RES_DIRECTORY     <-    file.path(DATA_DIRECTORY, run_name, "noM0_high_res")
+wM0_DIRECTORY               <-    file.path(DATA_DIRECTORY, run_name, "wM0")
+noM0_DIRECTORY              <-    file.path(DATA_DIRECTORY, run_name, "noM0")
+
+wM0_raw_files      <- orbi_find_raw(wM0_DIRECTORY)
+if (!dir.exists(wM0_HIGH_RES_DIRECTORY)) {
+  dir.create(wM0_HIGH_RES_DIRECTORY, recursive = TRUE)
 }
+
+logfile <- file.path(getwd(), "render.log")
+
+# stopifnot(length(wM0_raw_files) > 0)
+
+if (dir.exists(noM0_DIRECTORY)) {
+  noM0 <- TRUE
+  noM0_raw_files <- orbi_find_raw(noM0_DIRECTORY)
+  log_line("noM0 files: ", length(noM0_raw_files))
+  if (!dir.exists(noM0_HIGH_RES_DIRECTORY)) {
+    dir.create(noM0_HIGH_RES_DIRECTORY, recursive = TRUE)
+  }
+} else {
+  noM0 <- FALSE
+  log_line("noM0 directory does not exist")
+}
+
+dir.create("figures", recursive = TRUE, showWarnings = FALSE)
 ```
 
 ```{r read-reference-materials-json, include=FALSE, echo=FALSE}
@@ -569,9 +591,7 @@ sodium_sulfate_keys <- keep(
 )
 ```
 
-```{r read-raw-files, echo=FALSE, include=FALSE, eval=TRUE}
-
-# parallel processing setup
+```{r parallel-processing-setup, echo=FALSE, include=FALSE, eval=TRUE}
 Sys.setenv(
   OMP_NUM_THREADS = "1",
   MKL_NUM_THREADS = "1",
@@ -585,22 +605,27 @@ workers   <- max(1, min(32, all_cores) - reserve)
 message(sprintf("Using %d workers (available=%d, reserve=%d).", workers, all_cores, reserve))
 plan(multisession, workers = workers)
 
+opts <- furrr::furrr_options(
+  seed = TRUE,
+  scheduling = 2,
+  packages  = c("dplyr","tidyr","purrr","ggplot2","fs","tools","stringr")
+)
 
-raw_files_dir  <- file.path(DATA_DIRECTORY, RUN_DIRECTORY, RAW_DIRECTORY)
-raw_files      <- orbi_find_raw(raw_files_dir)
-stopifnot(length(raw_files) > 0)
+safe_one <- purrr::safely(process_one_raw_file, otherwise = NULL)
+```
 
-# remove samples to ignore
-sample_names <- sub('\\.raw$', "", basename(raw_files))
-raw_files <- raw_files[!sample_names %in% SAMPLES_TO_IGNORE]
+```{r read-wM0-raw-files, echo=FALSE, include=FALSE, eval=TRUE}
 
-sample_order <- as.integer(sub(".*_(\\d+)\\.raw$", "\\1", raw_files))
-raw_files <- raw_files[order(sample_order)]
+# remove samples to ignore from list of raw files
+wM0_sample_names <- sub('\\.raw$', "", basename(wM0_raw_files))
+wM0_raw_files <- wM0_raw_files[!wM0_sample_names %in% wM0_SAMPLES_TO_IGNORE]
 
+wM0_sample_order <- as.integer(sub(".*_(\\d+)\\.raw$", "\\1", wM0_raw_files))
+wM0_raw_files <- wM0_raw_files[order(wM0_sample_order)]
 
 # decide based on first raw file if we have measured SO3 or HSO4
-raw_agg_file <- raw_files[1] |> orbi_read_raw(include_spectra = FALSE) |> orbi_aggregate_raw()
-if (raw_agg_file$file_info$LowMass<80){
+raw_agg_file <- wM0_raw_files[1] |> orbi_read_raw(include_spectra = FALSE) |> orbi_aggregate_raw()
+if (raw_agg_file$file_info$LowMass<81){
   # SO3
   ISOTOPOCULES <- c("M0"=79.95736,
                     "33S"=80.95675,
@@ -621,34 +646,22 @@ iso_df <- data.frame(
   mz    = as.numeric(ISOTOPOCULES)
 )
 
+each_wM0_injection <- list()
 
-each_injection <- list()
-rows <- list()
 
-## --- safe wrapper + options ---
-safe_one <- purrr::safely(process_one_raw_file, otherwise = NULL)
-
-# NOTE: pass packages and any constants used inside workers explicitly
-opts <- furrr::furrr_options(
-  seed = TRUE,
-  scheduling = 2,
-  packages  = c("dplyr","tidyr","purrr","ggplot2","fs","tools","stringr")
-)
-
-results <- furrr::future_map(
-  raw_files,
-  ~ safe_one(.x, high_res_directory),
+wM0_results <- furrr::future_map(
+  wM0_raw_files,
+  ~ safe_one(.x, wM0_HIGH_RES_DIRECTORY, "M0"),
   .options = opts
 )
 
-## --- unwrap: each_injection, rows, summary, errors ---
-named_results <- purrr::set_names(results, tools::file_path_sans_ext(basename(raw_files)))
+wM0_named_results <- purrr::set_names(wM0_results, tools::file_path_sans_ext(basename(wM0_raw_files)))
 
-each_injection <- named_results |>
+each_wM0_injection <- wM0_named_results |>
   purrr::keep(~ is.null(.x$error)) |>
   purrr::map("result")
 
-errs <- named_results |>
+wM0_errs <- wM0_named_results |>
   purrr::keep(~ !is.null(.x$error)) |>
   purrr::imap(\(x, fname) {
     tibble(
@@ -660,12 +673,77 @@ errs <- named_results |>
   dplyr::bind_rows()
 ```
 
-```{r high-resolution-data-processing, echo=FALSE, include=FALSE}
+```{r read-noM0-raw-files, echo=FALSE, include=FALSE, eval=TRUE}
 
-largest_peaks  <- purrr::map(each_injection, "largest_peaks")
-largest_peaks_tbl <- imap_dfr(
+if (noM0==TRUE){
+  # remove samples to ignore from list of raw files
+  noM0_sample_names <- sub('\\.raw$', "", basename(noM0_raw_files))
+  noM0_raw_files <- noM0_raw_files[!noM0_sample_names %in% noM0_SAMPLES_TO_IGNORE]
+
+  noM0_sample_order <- as.integer(sub(".*_(\\d+)\\.raw$", "\\1", noM0_raw_files))
+  noM0_raw_files <- noM0_raw_files[order(noM0_sample_order)]
+
+
+  # decide based on first raw file if we have measured SO3 or HSO4
+  raw_agg_file <- noM0_raw_files[1] |> orbi_read_raw(include_spectra = FALSE) |> orbi_aggregate_raw()
+  log_line(noM0_raw_files[1])
+  if (raw_agg_file$file_info$LowMass<81){
+    # SO3
+    ISOTOPOCULES <- c("M0"=79.95736,
+                      "33S"=80.95675,
+                      "17O"=80.96158,
+                      "34S"=81.95316,
+                      "18O"=81.96161)
+  } else if (raw_agg_file$file_info$LowMass>90){
+  #  HSO4
+    ISOTOPOCULES <- c("M0"=96.96010,
+                      "33S"=97.95949,
+                      "17O"=97.96432,
+                      "34S"=98.95590,
+                      "18O"=98.96435)
+
+  }
+  iso_df <- data.frame(
+    label = names(ISOTOPOCULES),
+    mz    = as.numeric(ISOTOPOCULES)
+  )
+
+
+  each_noM0_injection <- list()
+
+  noM0_results <- furrr::future_map(
+    noM0_raw_files,
+    ~ safe_one(.x, noM0_HIGH_RES_DIRECTORY, "34S"),
+    .options = opts
+  )
+
+  noM0_named_results <- purrr::set_names(noM0_results, tools::file_path_sans_ext(basename(noM0_raw_files)))
+
+  each_noM0_injection <- noM0_named_results |>
+    purrr::keep(~ is.null(.x$error)) |>
+    purrr::map("result")
+
+  noM0_errs <- noM0_named_results |>
+    purrr::keep(~ !is.null(.x$error)) |>
+    purrr::imap(\(x, fname) {
+      tibble(
+        filename = fname,
+        message  = conditionMessage(x$error),
+        class    = paste(class(x$error), collapse = "/")
+      )
+    }) |>
+    dplyr::bind_rows()
+}
+```
+
+```{r wM0-high-resolution-data-processing, echo=FALSE, include=FALSE}
+largest_peaks  <- purrr::map(each_wM0_injection, "largest_peaks")
+largest_peaks_tbl <- purrr::imap_dfr(
   largest_peaks,
-  ~ mutate(.x, sample_id = .y)   # .y = name of the list element
+  ~ {
+    if (is.null(.x) || nrow(.x) == 0) return(NULL)
+    dplyr::mutate(.x, sample_id = .y)
+  }
 )
 
 largest_peaks_tbl <- largest_peaks_tbl %>%
@@ -674,32 +752,79 @@ largest_peaks_tbl <- largest_peaks_tbl %>%
     sample_name  = str_remove(sample_id, "_\\d+$")
   )
 
-readr::write_csv(largest_peaks_tbl, paste0(DATA_DIRECTORY, "/__Measured_Peaks__/", RUN_DIRECTORY, "_largest_peaks.csv"))
+readr::write_csv(largest_peaks_tbl, paste0(DATA_DIRECTORY, "/__Measured_Peaks__/", run_name, "_wM0_largest_peaks.csv"))
 
-rows           <- purrr::map(each_injection, "row")
-ruby_data_summary <- dplyr::bind_rows(rows)
+wM0_rows           <- purrr::map(each_wM0_injection, "row")
+wM0_ruby_data_summary <- dplyr::bind_rows(wM0_rows)
 
-for (i in seq_along(each_injection)) {
-  rec <- each_injection[[i]]
+for (i in seq_along(each_wM0_injection)) {
+  rec <- each_wM0_injection[[i]]
   if (!is.null(rec$largest_peaks) && nrow(rec$largest_peaks) > 0) {
     first_intensity <- rec$largest_peaks$peak_intensity[1]
-    ruby_data_summary$first_peak_intensity[i] <- first_intensity
+    wM0_ruby_data_summary$first_peak_intensity[i] <- first_intensity
     }
   }
 ```
 
+```{r noM0-high-resolution-data-processing, echo=FALSE, include=FALSE}
+if (noM0 == TRUE) {
+
+  # ---- 1) Build the main summary table FIRST ----
+  noM0_rows <- purrr::map(each_noM0_injection, "row")
+  noM0_ruby_data_summary <- dplyr::bind_rows(noM0_rows)
+
+  # ---- 2) Build peaks table ----
+  noM0_largest_peaks <- purrr::map(each_noM0_injection, "largest_peaks")
+  noM0_largest_peaks_tbl <- purrr::imap_dfr(
+    noM0_largest_peaks,
+    ~{
+      if (is.null(.x) || nrow(.x) == 0) return(NULL)
+      dplyr::mutate(.x, sample_id = .y)   # .y = list element name
+    }
+  )
+
+  if (nrow(noM0_largest_peaks_tbl) > 0) {
+
+    # ---- 3) Add keys (sample_name, sample_order) derived from sample_id ----
+    noM0_largest_peaks_tbl <- noM0_largest_peaks_tbl %>%
+      dplyr::mutate(
+        sample_order = as.integer(stringr::str_extract(sample_id, "\\d+$")),
+        sample_name  = stringr::str_remove(sample_id, "_\\d+$")
+      )
+
+    # ---- 4) Summarise to one value per analysis ----
+    noM0_first_intensity_tbl <- noM0_largest_peaks_tbl %>%
+      dplyr::group_by(sample_name, sample_order) %>%
+      dplyr::summarise(first_peak_intensity = max(peak_intensity), .groups = "drop")
+
+    # ---- 5) Join into summary (order-proof) ----
+    noM0_ruby_data_summary <- noM0_ruby_data_summary %>%
+      dplyr::mutate(sample_order = as.integer(sample_order)) %>%  # type safety
+      dplyr::left_join(noM0_first_intensity_tbl, by = c("sample_name", "sample_order"))
+
+  } else {
+    # Ensure the column exists even if there are no peaks
+    noM0_ruby_data_summary$first_peak_intensity <- NA_real_
+  }
+
+  # ---- 6) Optional export ----
+  readr::write_csv(
+    noM0_largest_peaks_tbl,
+    paste0(DATA_DIRECTORY, "/__Measured_Peaks__/", run_name, "_noM0_largest_peaks.csv")
+  )
+}
+```
+
 ```{r determine-standards-present, echo=FALSE, include=FALSE}
-BRACKETING_REFERENCE <- unique(ruby_data_summary$sample_name)[
-  grepl("_ref$", unique(ruby_data_summary$sample_name))
+BRACKETING_REFERENCE <- unique(wM0_ruby_data_summary$sample_name)[
+  grepl("_ref$", unique(wM0_ruby_data_summary$sample_name))
 ]
-
-
 ```
 
 <details><summary class="expandable_subtitles">High Resolution Summary</summary>
 
-```{r figure-style, echo=FALSE, include=FALSE}
 
+```{r figure-style, echo=FALSE, include=FALSE}
 sulfate_figure_theme <- theme_minimal() +
                         theme(
                           axis.line = element_line(color = "black", linewidth = 1),
@@ -736,7 +861,7 @@ STANDARD_SHAPES <- c(
 )
 NONSTANDARD_PALETTE <- viridis
 
-all_levels <- levels(factor(ruby_data_summary$sample_name))
+all_levels <- levels(factor(wM0_ruby_data_summary$sample_name))
 standards_present <- intersect(sodium_sulfate_keys, all_levels)
 standards_present <- c(standards_present, BRACKETING_REFERENCE)
 nonstandards_present <- setdiff(all_levels, standards_present)
@@ -750,21 +875,20 @@ if (n_non > 0) {
 }
 shape_values <- setNames(rep(21, length(all_levels)), all_levels)  # default circle
 shape_values[standards_present] <- STANDARD_SHAPES[standards_present]
-
 ```
 
 
-```{r high-res-summary-figures, fig.width=12, fig.height=8, fig.show='hold', echo=FALSE}
+```{r wM0-high-res-summary-figures, fig.width=12, fig.height=8, fig.show='hold', echo=FALSE}
 knitr::opts_chunk$set(fig.show = "hold")
 fig_n <- 1
 run_figures <- list()
 
-title_text =  sprintf("Figure %d - TIC vs sample order", fig_n)
+title_text =  sprintf("wM0 Figure %d - TIC vs sample order", fig_n)
 run_figures[[fig_n]] <- list(
     title_text =  title_text,
     anchor = sprintf("fig%d", fig_n),
     caption_text = "Total Ion Count versus sample order",
-    plot = ggplot(ruby_data_summary) + 
+    plot = ggplot(wM0_ruby_data_summary) + 
         geom_errorbar(aes(x = sample_order, ymin = TICmean - TICsd, ymax = TICmean + TICsd, color = sample_name),
                       width = 0.2, linewidth = 1) +
         geom_point(aes(x=sample_order, y=TICmean, shape=sample_name, fill=sample_name), size=6) +
@@ -772,19 +896,19 @@ run_figures[[fig_n]] <- list(
         scale_shape_manual(values=shape_values) +
         scale_fill_manual(values=color_values) +
         geom_text(aes(x = sample_order, y = TICmean, label = sample_order), 
-                  color = sapply(color_values[ruby_data_summary$sample_name], ideal_text_color),
+                  color = sapply(color_values[wM0_ruby_data_summary$sample_name], ideal_text_color),
                   size = 2.5, fontface = "bold", vjust = 0.35) +
         labs(title = title_text))
 print(run_figures[[fig_n]]$plot)
 
 fig_n <- fig_n + 1
 
-title_text =  sprintf("Figure %d - OIC vs sample order", fig_n)
+title_text =  sprintf("wM0 Figure %d - OIC vs sample order", fig_n)
 run_figures[[fig_n]] <- list(
     title_text =  title_text,
     anchor = sprintf("fig%d", fig_n),
     caption_text = "Orbitrap Ion Count versus sample order",
-    plot = ggplot(ruby_data_summary) + 
+    plot = ggplot(wM0_ruby_data_summary) + 
         geom_errorbar(aes(x = sample_order, ymin = OICmean - OICsd, ymax = OICmean + OICsd, color = sample_name),
                       width = 0.2, linewidth = 1) +
         geom_point(aes(x=sample_order, y=OICmean, shape=sample_name, fill=sample_name), size = 6) +
@@ -792,23 +916,65 @@ run_figures[[fig_n]] <- list(
         scale_shape_manual(values=shape_values) +
         scale_fill_manual(values=color_values) +
         geom_text(aes(x = sample_order, y = OICmean, label = sample_order), 
-                  color = sapply(color_values[ruby_data_summary$sample_name], ideal_text_color),
+                  color = sapply(color_values[wM0_ruby_data_summary$sample_name], ideal_text_color),
                   size = 2.5, fontface = "bold", vjust = 0.35) +  
         labs(title = title_text))
 print(run_figures[[fig_n]]$plot)
 ```
 
+```{r noM0-high-res-summary-figures, fig.width=12, fig.height=8, fig.show='hold', echo=FALSE}
+if (noM0==TRUE){
+  knitr::opts_chunk$set(fig.show = "hold")
+  fig_n <- fig_n + 1
+
+  title_text =  sprintf("noM0 Figure %d - TIC vs sample order", fig_n)
+  run_figures[[fig_n]] <- list(
+      title_text =  title_text,
+      anchor = sprintf("fig%d", fig_n),
+      caption_text = "Total Ion Count versus sample order",
+      plot = ggplot(noM0_ruby_data_summary) + 
+          geom_errorbar(aes(x = sample_order, ymin = TICmean - TICsd, ymax = TICmean + TICsd, color = sample_name),
+                        width = 0.2, linewidth = 1) +
+          geom_point(aes(x=sample_order, y=TICmean, shape=sample_name, fill=sample_name), size=6) +
+          scale_color_manual(values=color_values) +
+          scale_shape_manual(values=shape_values) +
+          scale_fill_manual(values=color_values) +
+          geom_text(aes(x = sample_order, y = TICmean, label = sample_order), 
+                    color = sapply(color_values[noM0_ruby_data_summary$sample_name], ideal_text_color),
+                    size = 2.5, fontface = "bold", vjust = 0.35) +
+          labs(title = title_text))
+  print(run_figures[[fig_n]]$plot)
+
+  fig_n <- fig_n + 1
+
+  title_text =  sprintf("noM0 Figure %d - OIC vs sample order", fig_n)
+  run_figures[[fig_n]] <- list(
+      title_text =  title_text,
+      anchor = sprintf("fig%d", fig_n),
+      caption_text = "Orbitrap Ion Count versus sample order",
+      plot = ggplot(noM0_ruby_data_summary) + 
+          geom_errorbar(aes(x = sample_order, ymin = OICmean - OICsd, ymax = OICmean + OICsd, color = sample_name),
+                        width = 0.2, linewidth = 1) +
+          geom_point(aes(x=sample_order, y=OICmean, shape=sample_name, fill=sample_name), size = 6) +
+          scale_color_manual(values=color_values) +
+          scale_shape_manual(values=shape_values) +
+          scale_fill_manual(values=color_values) +
+          geom_text(aes(x = sample_order, y = OICmean, label = sample_order), 
+                    color = sapply(color_values[noM0_ruby_data_summary$sample_name], ideal_text_color),
+                    size = 2.5, fontface = "bold", vjust = 0.35) +  
+          labs(title = title_text))
+  print(run_figures[[fig_n]]$plot)
+}
+```
+
 </details>
 
-<details><summary class="expandable_subtitles">High Resolution Individual Injections</summary>
+<details><summary class="expandable_subtitles">High Resolution wM0 Individual Injections</summary>
 
 
-```{r emit-sample-sections, results='asis', comment=NA, echo=FALSE, message=FALSE, warning=FALSE}
+```{r emit-wM0-sample-sections, results='asis', comment=NA, echo=FALSE, message=FALSE, warning=FALSE}
 
-
-
-
-for (rec in each_injection) {
+for (rec in each_wM0_injection) {
   cat(sprintf('<details class="high_res_sample"><summary>%s</summary>\n', rec$filename))
 
   # --- Row 1: small zoomed images -----------------------------------------
@@ -867,13 +1033,75 @@ for (rec in each_injection) {
 
 </details>
 
+
+```{r emit-noM0-sample-sections, results='asis', comment=NA, echo=FALSE, message=FALSE, warning=FALSE}
+
+if (noM0==TRUE){
+  cat('<details><summary class="expandable_subtitles">High Resolution noM0 Individual Injections</summary>')
+  for (rec in each_noM0_injection) {
+    cat(sprintf('<details class="high_res_sample"><summary>%s</summary>\n', rec$filename))
+
+    # --- Row 1: small zoomed images -----------------------------------------
+    cat('<div style="display:flex; gap:0.5rem; flex-wrap:wrap; margin-bottom:0.5rem;">\n')
+    for (img in rec$images) {
+      cat(sprintf(
+        '<img src="%s" style="max-width:30%%; height:auto;">\n',
+        img
+      ))
+    }
+    cat('</div>\n')
+
+    # --- Row 2: full-range image + Ten largest peaks table side-by-side -----
+    if (!is.null(rec$full_mzRange_image) && !is.null(rec$largest_peaks) && nrow(rec$largest_peaks) > 0) {
+
+      # flex container for image + table
+      cat('<div style="display:flex; gap:1rem; align-items:flex-start; margin-bottom:0.5rem;">\n')
+
+      # left: full-range image (~70% of width)
+      cat(sprintf(
+        '<div style="flex:0 0 70%%;"><img src="%s" style="width:100%%; height:auto;"></div>\n',
+        rec$full_mzRange_image
+      ))
+
+      # right: table (~30% of width)
+      cat('<div style="flex:1;">Ten largest peaks:',
+      '<table style="border-collapse:collapse; margin-top:0.5rem;">\n')
+      cat('<tr>',
+      '<th style="border:1px solid #ccc; padding:4px;">Mean m/z</th>',
+      '<th style="border:1px solid #ccc; padding:4px;">Mean Intensity</th>',
+      '</tr>\n')
+      for (i in seq_len(nrow(rec$largest_peaks))) {
+        cat('<tr>',
+        sprintf('<td style="border:1px solid #ccc; padding:4px;">%.4f</td>',
+        rec$largest_peaks$mean_mz[i]),
+        sprintf('<td style="border:1px solid #ccc; padding:4px;">%.0f</td>',
+        rec$largest_peaks$peak_intensity[i]),
+        '</tr>\n')
+      }
+      cat('</table></div>\n')  # close right-side div
+      cat('</div>\n')         # close flex container
+    } else {
+      # if you still want to show the full image even when no table:
+      if (!is.null(rec$full_mzRange_image)) {
+        cat(sprintf(
+          '<img src="%s" style="max-width:100%%; height:auto; margin-bottom:0.5rem;">\n',
+          rec$full_mzRange_image
+          ))
+        }
+    }
+
+    cat('</details>\n\n')
+  }
+  cat('</details>\n\n')
+}
+```
+
 <details><summary class="expandable_subtitles">Analyzer Temperature</summary>
 
 ```{r organize-data, echo=FALSE, include=FALSE}
 message('\n ---------- sort based on sample order ----------')
-ruby_data_summary <- ruby_data_summary[order(ruby_data_summary$sample_order), ]
-
-ruby_data_summary <- ruby_data_summary %>%
+wM0_ruby_data_summary <- wM0_ruby_data_summary[order(wM0_ruby_data_summary$sample_order), ]
+wM0_ruby_data_summary <- wM0_ruby_data_summary %>%
   rename(
     R34S = R34Smean,
     R33S = R33Smean,
@@ -881,25 +1109,33 @@ ruby_data_summary <- ruby_data_summary %>%
     R17O = R17Omean
   )
 
+if (noM0==TRUE){
+  noM0_ruby_data_summary <- noM0_ruby_data_summary[order(noM0_ruby_data_summary$sample_order), ]
+  noM0_ruby_data_summary <- noM0_ruby_data_summary %>%
+    rename(
+      R33S = R33Smean,
+      R18O = R18Omean,
+      R17O = R17Omean
+    )
+}
 ```
 
 Analyzer temperature is stored in the .raw data files. While we still don\'t know where exactly in the instrument this measurement originates, it does track with lab temperature. Furthermore, it also seems to explain much of the ratio variability.
 
 ```{r AnalyzerTemperature, echo=FALSE, fig.width=10, fig.height=6}
-plot_temperature(ruby_data_summary)
+plot_temperature(wM0_ruby_data_summary, "wM0")
+if (noM0==TRUE){
+  plot_temperature(noM0_ruby_data_summary, "noM0")
+}
 ```
 
 </details>
 
-<details><summary class="expandable_subtitles">Bracketing References</summary>
+```{r wM0-bracketing, include=FALSE, echo=FALSE}
+bracketing_references <- subset(wM0_ruby_data_summary, sample_name == BRACKETING_REFERENCE)
+wM0_analyses <- subset(wM0_ruby_data_summary, sample_name != BRACKETING_REFERENCE)
 
-```{r bracketing, include=FALSE, echo=FALSE}
-bracketing_references <- subset(ruby_data_summary, sample_name == BRACKETING_REFERENCE)
-analyses <- subset(ruby_data_summary, sample_name != BRACKETING_REFERENCE)
-message("\nwM0 rows in bracketing references:", nrow(bracketing_references))
-message("wM0 rows in other analyses:", nrow(analyses))
-
-analyses <- analyses %>%
+wM0_analyses <- wM0_analyses %>%
   rowwise() %>%
   mutate(
     nearest_ref_before = find_nearest(sample_order, bracketing_references$sample_order)[1],
@@ -907,7 +1143,7 @@ analyses <- analyses %>%
   ) %>%
   ungroup()
 
-analyses <- analyses %>%
+wM0_analyses <- wM0_analyses %>%
   left_join(
     bracketing_references %>%
       select(sample_order, analyzerTmean, TICmean, OICmean, first_peak_intensity) %>%
@@ -929,7 +1165,7 @@ analyses <- analyses %>%
     ratio_mpi = first_peak_intensity/((mpi_before + mpi_after)/2)
   )
 
-analyses <- analyses %>%
+wM0_analyses <- wM0_analyses %>%
   left_join(
     bracketing_references %>% 
       select(sample_order, R34S, R33S, R18O, R17O) %>%
@@ -959,20 +1195,97 @@ analyses <- analyses %>%
 
 ratio_cols <- c("R34S", "R33S", "R18O", "R17O")
 ref_ratio_cols <- c("R34S_ref", "R33S_ref", "R18O_ref", "R17O_ref")
-deltas <- (analyses[, ratio_cols] / analyses[, ref_ratio_cols] - 1)*1000
-colnames(deltas) <- sub("^R", "d", colnames(deltas))
-analyses <- cbind(analyses, deltas)
-analyses$D17O <- analyses$d17O - 0.52 * analyses$d18O
+wM0_deltas <- (wM0_analyses[, ratio_cols] / wM0_analyses[, ref_ratio_cols] - 1)*1000
+colnames(wM0_deltas) <- sub("^R", "d", colnames(wM0_deltas))
+colnames(wM0_deltas) <- sub("S$", "S32S", colnames(wM0_deltas))
+colnames(wM0_deltas) <- sub("O$", "O16O", colnames(wM0_deltas))
+# delta column names are now d34S32S, d33S32S, d18O16O, d17O16O
+wM0_analyses <- cbind(wM0_analyses, wM0_deltas)
+
 ```
 
-```{r visualize-bracketing-references, echo=FALSE, fig.width=10, fig.height=6}
+```{r noM0-bracketing, include=FALSE, echo=FALSE}
+if (noM0==TRUE){
+  noM0_bracketing_references <- subset(noM0_ruby_data_summary, sample_name == BRACKETING_REFERENCE)
+  noM0_analyses <- subset(noM0_ruby_data_summary, sample_name != BRACKETING_REFERENCE)
+
+  noM0_analyses <- noM0_analyses %>%
+    rowwise() %>%
+    mutate(
+      nearest_ref_before = find_nearest(sample_order, bracketing_references$sample_order)[1],
+      nearest_ref_after = find_nearest(sample_order, bracketing_references$sample_order)[2]
+    ) %>%
+    ungroup()
+
+  noM0_analyses <- noM0_analyses %>%
+    left_join(
+      noM0_bracketing_references %>%
+        select(sample_order, analyzerTmean, TICmean, OICmean, first_peak_intensity) %>%
+        rename(nearest_ref_before = sample_order, mean_temp_before = analyzerTmean, TIC_before = TICmean, OIC_before = OICmean, mpi_before = first_peak_intensity),
+      by = "nearest_ref_before"
+    ) %>%
+    left_join(
+      noM0_bracketing_references %>%
+        select(sample_order, analyzerTmean, TICmean, OICmean, first_peak_intensity) %>%
+        rename(nearest_ref_after = sample_order, mean_temp_after = analyzerTmean, TIC_after = TICmean, OIC_after = OICmean, mpi_after = first_peak_intensity),
+      by = "nearest_ref_after"
+    ) %>%
+    mutate(
+      diff_temp_before = abs(analyzerTmean - mean_temp_before),
+      diff_temp_after = abs(analyzerTmean - mean_temp_after),
+      diff_TIC = ((TICmean-TIC_before)+(TICmean-TIC_after))/2,
+      ratio_TIC = TICmean/((TIC_before+TIC_after)/2),
+      ratio_OIC = OICmean/((OIC_before+OIC_after)/2),
+      ratio_mpi = first_peak_intensity/((mpi_before + mpi_after)/2)
+    )
+
+  noM0_analyses <- noM0_analyses %>%
+    left_join(
+      noM0_bracketing_references %>% 
+        select(sample_order, R33S, R18O, R17O) %>%
+        rename(nearest_ref_before = sample_order, 
+               R33S_before = R33S, 
+               R18O_before = R18O, R17O_before = R17O),
+      by = "nearest_ref_before"
+    ) %>%
+    left_join(
+      noM0_bracketing_references %>%
+        select(sample_order, R33S, R18O, R17O) %>%
+        rename(nearest_ref_after = sample_order, 
+               R33S_after = R33S, 
+               R18O_after = R18O, R17O_after = R17O),
+      by = "nearest_ref_after"
+    ) %>%
+    rowwise() %>%
+    mutate(
+      R33S_ref = compute_ref(R33S_before, R33S_after, diff_temp_before, diff_temp_after),
+      R18O_ref = compute_ref(R18O_before, R18O_after, diff_temp_before, diff_temp_after),
+      R17O_ref = compute_ref(R17O_before, R17O_after, diff_temp_before, diff_temp_after)
+    ) %>%
+    ungroup() %>%
+    select(-R33S_before, -R33S_after, 
+           -R18O_before, -R18O_after, -R17O_before, -R17O_after)
+
+  noM0_ratio_cols <- c("R33S", "R18O", "R17O")
+  noM0_ref_ratio_cols <- c("R33S_ref", "R18O_ref", "R17O_ref")
+  noM0_deltas <- (noM0_analyses[, noM0_ratio_cols] / noM0_analyses[, noM0_ref_ratio_cols] - 1)*1000
+  colnames(noM0_deltas) <- sub("^R", "d", colnames(noM0_deltas))
+  colnames(noM0_deltas) <- sub("S$", "S34S", colnames(noM0_deltas))
+  colnames(noM0_deltas) <- sub("O$", "O34S", colnames(noM0_deltas))
+  # delta column names are now d33S34S, d18O34S, d17O34S
+  noM0_analyses <- cbind(noM0_analyses, noM0_deltas)
+}
+```
+<details><summary class="expandable_subtitles">Bracketing References - wM0</summary>
+
+```{r visualize-bracketing-references-wM0, echo=FALSE, warning=FALSE, fig.width=10, fig.height=6}
 Fig__R34S_vs_order <- ggplot() +
   geom_point(data = bracketing_references,
              mapping = aes(x=sample_order, y=R34S, shape=sample_name, fill=sample_name), size = 6) +
   geom_label_order(bracketing_references, aes(x = sample_order, y = R34S, label = sample_order)) +
-  geom_point(data = analyses,
+  geom_point(data = wM0_analyses,
              mapping = aes(x=sample_order, y=R34S, shape=sample_name, fill=sample_name), size=6) +
-  geom_label_order(analyses, aes(x = sample_order, y = R34S, label = sample_order)) +
+  geom_label_order(wM0_analyses, aes(x = sample_order, y = R34S, label = sample_order)) +
   scale_color_manual(values=color_values) +
   scale_shape_manual(values=shape_values) +
   scale_fill_manual(values=color_values) +
@@ -983,9 +1296,9 @@ Fig__R34Sref_vs_order <- ggplot() +
   geom_point(data = bracketing_references,
              mapping = aes(x = sample_order, y = R34S, shape=sample_name, fill=sample_name), size=6) +
   geom_label_order(bracketing_references, aes(x = sample_order, y = R34S, label = sample_order)) +
-  geom_point(data = analyses, 
+  geom_point(data = wM0_analyses, 
              mapping = aes(x = sample_order, y = R34S_ref, shape=sample_name, fill=sample_name), size=6) +
-  geom_label_order(analyses, aes(x = sample_order, y = R34S_ref, label = sample_order)) +
+  geom_label_order(wM0_analyses, aes(x = sample_order, y = R34S_ref, label = sample_order)) +
   scale_color_manual(values=color_values) +
   scale_shape_manual(values=shape_values) +
   scale_fill_manual(values=color_values) +
@@ -996,9 +1309,9 @@ Fig__R34Sref_vs_order <- ggplot() +
 print(Fig__R34Sref_vs_order)
 
 Fig__R34Sref_vs_AnalyzerT <- ggplot() +
-  geom_point(data = analyses, 
+  geom_point(data = wM0_analyses, 
              mapping = aes(x = analyzerTmean, y = R34S_ref, shape=sample_name, fill=sample_name), size=6) +
-  geom_label_order(analyses, aes(x = analyzerTmean, y = R34S_ref, label = sample_order)) +
+  geom_label_order(wM0_analyses, aes(x = analyzerTmean, y = R34S_ref, label = sample_order)) +
   scale_color_manual(values=color_values) +
   scale_shape_manual(values=shape_values) +
   scale_fill_manual(values=color_values) +
@@ -1009,23 +1322,75 @@ print(Fig__R34Sref_vs_AnalyzerT)
 ```
 </details>
 
-<details><summary class="expandable_subtitles">Raw Data Summary</summary>
+```{r visualize-bracketing-references-noM0, results='asis', comment=NA, echo=FALSE, message=FALSE, warning=FALSE, fig.width=10, fig.height=6}
+if (noM0==TRUE){
+  cat('<details><summary class="expandable_subtitles">Bracketing References - noM0</summary>\n')
+    Fig__R33S34S_vs_order__noM0 <- ggplot() +
+    geom_point(data = noM0_bracketing_references,
+               mapping = aes(x=sample_order, y=R33S, shape=sample_name, fill=sample_name), size = 6) +
+    geom_label_order(noM0_bracketing_references, aes(x = sample_order, y = R33S, label = sample_order)) +
+    geom_point(data = noM0_analyses,
+               mapping = aes(x=sample_order, y=R33S, shape=sample_name, fill=sample_name), size=6) +
+    geom_label_order(noM0_analyses, aes(x = sample_order, y = R33S, label = sample_order)) +
+    scale_color_manual(values=color_values) +
+    scale_shape_manual(values=shape_values) +
+    scale_fill_manual(values=color_values) +
+    labs(title = "noM0 R33S34S vs sample order", x = "Sample order", y = "R33S34S")
+  f1 <- file.path("figures","Fig__R33S34S_vs_order__noM0.png")
+  ggsave(f1, Fig__R33S34S_vs_order__noM0, width = 10, height = 6, dpi = 150)
 
-```{r summarize-replicates, echo=FALSE}
-run_summary <- analyses %>%
+  Fig__R33S34Sref_vs_order__noM0 <- ggplot() +
+    geom_point(data = noM0_bracketing_references,
+               mapping = aes(x = sample_order, y = R33S, shape=sample_name, fill=sample_name), size=6) +
+    geom_label_order(noM0_bracketing_references, aes(x = sample_order, y = R33S, label = sample_order)) +
+    geom_point(data = noM0_analyses, 
+               mapping = aes(x = sample_order, y = R33S_ref, shape=sample_name, fill=sample_name), size=6) +
+    geom_label_order(noM0_analyses, aes(x = sample_order, y = R33S_ref, label = sample_order)) +
+    scale_color_manual(values=color_values) +
+    scale_shape_manual(values=shape_values) +
+    scale_fill_manual(values=color_values) +
+    labs(
+      title = "noM0 Bracketing references R33S34S vs sample order.",
+      x = "Sample order",
+      y = "Bracketing reference R33S34S")
+  f2 <- file.path("figures","Fig__R33S34Sref_vs_order__noM0.png")
+  ggsave(f2, Fig__R33S34Sref_vs_order__noM0, width = 10, height = 6, dpi = 150)
+
+  Fig__R33S34Sref_vs_AnalyzerT__noM0 <- ggplot() +
+    geom_point(data = noM0_analyses, 
+               mapping = aes(x = analyzerTmean, y = R33S_ref, shape=sample_name, fill=sample_name), size=6) +
+    geom_label_order(noM0_analyses, aes(x = analyzerTmean, y = R33S_ref, label = sample_order)) +
+    scale_color_manual(values=color_values) +
+    scale_shape_manual(values=shape_values) +
+    scale_fill_manual(values=color_values) +
+    labs(title = paste0("noM0 R33S34S_ref vs Analyzer temperature"),
+         x = "Mean Analyzer Temp (*C)",
+         y = "Bracketing Reference R33S34S")
+  f3 <- file.path("figures","Fig__R33S34Sref_vs_AnalyzerT__noM0.png")
+  ggsave(f3, Fig__R33S34Sref_vs_AnalyzerT__noM0, width = 10, height = 6, dpi = 150)
+
+  for (f in c(f1, f2, f3)) {
+    cat(sprintf('<p><img src="%s" style="max-width: 100%%; height: auto;"></p>\n', f))
+  }
+  cat('</details>\n\n')
+}
+```
+
+<details><summary class="expandable_subtitles">Raw Data Summary - wM0</summary>
+
+```{r summarize-wM0-replicates, echo=FALSE, warning=FALSE}
+wM0_run_summary <- wM0_analyses %>%
   group_by(sample_name) %>%
   summarise(
-    n = sum(!is.na(d34S)),
-    d34S_mean_val = mean(d34S, na.rm=TRUE),
-    d34S_sd_val = sd(d34S, na.rm=TRUE),
-    d33S_mean_val = mean(d33S, na.rm=TRUE),
-    d33S_sd_val = sd(d33S, na.rm=TRUE),        
-    d18O_mean_val = mean(d18O, na.rm=TRUE),
-    d18O_sd_val = sd(d18O, na.rm=TRUE),
-    d17O_mean_val = mean(d17O, na.rm=TRUE),
-    d17O_sd_val = sd(d17O, na.rm=TRUE),
-    D17O_mean_val = mean(D17O, na.rm=TRUE),
-    D17O_sd_val = sd(D17O, na.rm=TRUE),
+    n = sum(!is.na(d34S32S)),
+    d34S32S_mean_val = mean(d34S32S, na.rm=TRUE),
+    d34S32S_sd_val = sd(d34S32S, na.rm=TRUE),
+    d33S32S_mean_val = mean(d33S32S, na.rm=TRUE),
+    d33S32S_sd_val = sd(d33S32S, na.rm=TRUE),        
+    d18O16O_mean_val = mean(d18O16O, na.rm=TRUE),
+    d18O16O_sd_val = sd(d18O16O, na.rm=TRUE),
+    d17O16O_mean_val = mean(d17O16O, na.rm=TRUE),
+    d17O16O_sd_val = sd(d17O16O, na.rm=TRUE),
     mean_tic_val = mean(TICmean, na.rm=TRUE),
     sd_tic_val = sd(TICmean, na.rm=TRUE),
     mean_tic_diff = mean(diff_TIC, na.rm=TRUE),
@@ -1037,59 +1402,161 @@ run_summary <- analyses %>%
     .groups = "drop"
   ) %>%
   mutate(
-    d34S_mean = round(d34S_mean_val, 1),
-    d34S_sd = round(d34S_sd_val, 2),
-    d33S_mean = round(d33S_mean_val, 1),
-    d33S_sd = round(d33S_sd_val, 2),
-    d18O_mean = round(d18O_mean_val, 2),
-    d18O_sd = round(d18O_sd_val, 2),
-    d17O_mean = round(d17O_mean_val, 2),
-    d17O_sd = round(d17O_sd_val, 2),
-    D17O_mean = round(D17O_mean_val, 2),
-    D17O_sd = round(D17O_sd_val, 2),
+    d34S32S_mean = round(d34S32S_mean_val, 1),
+    d34S32S_sd = round(d34S32S_sd_val, 2),
+    d33S32S_mean = round(d33S32S_mean_val, 1),
+    d33S32S_sd = round(d33S32S_sd_val, 2),
+    d18O16O_mean = round(d18O16O_mean_val, 2),
+    d18O16O_sd = round(d18O16O_sd_val, 2),
+    d17O16O_mean = round(d17O16O_mean_val, 2),
+    d17O16O_sd = round(d17O16O_sd_val, 2),
     TICmean = formatC(mean_tic_val, format = "e", digits = 2),
     TICsd = formatC(sd_tic_val, format = "e", digits = 2),
     TICdiff = formatC(mean_tic_diff, format = "e", digits = 2),
     TICdiffsd = formatC(sd_tic_diff, format = "e", digits = 2),
     TICratio = formatC(mean_tic_ratio, format = "e", digits = 2),
     TICratiosd = formatC(sd_tic_ratio, format = "e", digits = 2),
-    run_name = RUN_DIRECTORY,
-    run_date = substr(RUN_DIRECTORY, 1, 6),
+    run_name = run_name,
+    run_date = substr(run_name, 1, 6),
     concentration = extract_conc(sample_name)   # ← add here
   ) %>%
   select(sample_name, n,
          TICmean, TICsd, TICdiff, TICdiffsd, TICratio, TICratiosd,
-         d34S_mean, d34S_sd, d18O_mean, d18O_sd,
-         D17O_mean, D17O_sd,
-         d17O_mean, d17O_sd, d33S_mean, d33S_sd,
+         d34S32S_mean, d34S32S_sd, d33S32S_mean, d33S32S_sd,
+         d18O16O_mean, d18O16O_sd, d17O16O_mean, d17O16O_sd, 
          run_name, run_date, concentration)
 
-scale_compression <- round(100 * (1 - (run_summary$d34S_mean[run_summary$sample_name=='S_MIF_2']-run_summary$d34S_mean[run_summary$sample_name=='SodSul_8']) / 30.9), 0)
+scale_compression <- round(100 * (1 - (wM0_run_summary$d34S32S_mean[wM0_run_summary$sample_name=='S_MIF_2']-wM0_run_summary$d34S32S_mean[wM0_run_summary$sample_name=='SodSul_8']) / 30.9), 0)
 
 # -------------------- Raw data summary table --------------------
 run_summary_table_col_names <- c("Sample<br>Name", "n", "TIC<br>Mean", "TIC<br>SD", "TICdiff","TICdiffsd", "TICratio", "TICratiosd",
-               "&#948;<sup>34</sup>S<br>Mean<br>(&#8240;)", "&#948;<sup>34</sup>S<br>SD",
-               "&#948;<sup>18</sup>O<br>Mean<br>(&#8240;)", "&#948;<sup>18</sup>O<br>SD",
-               "&#916;<sup>17</sup>O<br>Mean<br>(&#8240;)", "&#916;<sup>17</sup>O<br>SD")
+               "&#948;34S32S<br>Mean<br>(&#8240;)", "&#948;34S32S<br>SD",
+               "&#948;18O16O<br>Mean<br>(&#8240;)", "&#948;18O16O<br>SD")
 run_summary_display_columns <- c("sample_name", "n", "TICmean", "TICsd","TICdiff","TICdiffsd","TICratio","TICratiosd",
-                                     "d34S_mean", "d34S_sd",
-                                     "d18O_mean", "d18O_sd",
-                                     "D17O_mean", "D17O_sd")
+                                     "d34S32S_mean", "d34S32S_sd",
+                                     "d18O16O_mean", "d18O16O_sd")
 
-caption_text <- paste("Summary of measured &#948;<sup>34</sup>S, &#948;<sup>18</sup>O, and &#916;<sup>17</sup>O versus the bracketing standard. Scale compression based on d34S of S-MIF-2 and SodSul-8 = ", scale_compression, " %.")
+caption_text <- paste("Summary of measured &#948;34S32S and &#948;18O16O versus the bracketing standard. Scale compression based on d34S32S of S-MIF-2 and SodSul-8 = ", scale_compression, " %.")
 
-knitr::kable(run_summary[, run_summary_display_columns], format = "html", caption = caption_text, 
+knitr::kable(wM0_run_summary[, run_summary_display_columns], format = "html", caption = caption_text, 
              align = "c", col.names = run_summary_table_col_names, escape = FALSE) %>%
   column_spec(1, bold = TRUE)  # Makes the first column bold
 ```
 </details>
 
-<details><summary class="expandable_subtitles">Calibration to VCDT and VSMOW</summary>
+```{r summarize-noM0-replicates, results='asis', echo=FALSE, message=FALSE, warning=FALSE}
+if (noM0 == TRUE) {
+
+  cat('<details><summary class="expandable_subtitles">Raw Data Summary - noM0</summary>\n')
+
+  noM0_run_summary <- noM0_analyses %>%
+    dplyr::group_by(sample_name) %>%
+    dplyr::summarise(
+      n = sum(!is.na(d33S34S)),
+      d33S34S_mean_val = mean(d33S34S, na.rm=TRUE),
+      d33S34S_sd_val = sd(d33S34S, na.rm=TRUE),
+      d18O34S_mean_val = mean(d18O34S, na.rm=TRUE),
+      d18O34S_sd_val = sd(d18O34S, na.rm=TRUE),
+      d17O34S_mean_val = mean(d17O34S, na.rm=TRUE),
+      d17O34S_sd_val = sd(d17O34S, na.rm=TRUE),
+      mean_tic_val = mean(TICmean, na.rm=TRUE),
+      sd_tic_val = sd(TICmean, na.rm=TRUE),
+      mean_tic_diff = mean(diff_TIC, na.rm=TRUE),
+      sd_tic_diff = sd(diff_TIC, na.rm=TRUE),
+      mean_tic_ratio = mean(ratio_TIC, na.rm=TRUE),
+      sd_tic_ratio = sd(ratio_TIC, na.rm=TRUE),
+      mean_oic_ratio = mean(ratio_OIC, na.rm=TRUE),
+      sd_oic_ratio = sd(ratio_OIC, na.rm=TRUE),
+      .groups = "drop"
+    ) %>%
+    dplyr::mutate(
+      d33S34S_mean = round(d33S34S_mean_val, 1),
+      d33S34S_sd   = round(d33S34S_sd_val, 2),
+      d18O34S_mean = round(d18O34S_mean_val, 2),
+      d18O34S_sd   = round(d18O34S_sd_val, 2),
+      d17O34S_mean = round(d17O34S_mean_val, 2),
+      d17O34S_sd   = round(d17O34S_sd_val, 2),
+      TICmean    = formatC(mean_tic_val, format = "e", digits = 2),
+      TICsd      = formatC(sd_tic_val, format = "e", digits = 2),
+      TICdiff    = formatC(mean_tic_diff, format = "e", digits = 2),
+      TICdiffsd  = formatC(sd_tic_diff, format = "e", digits = 2),
+      TICratio   = formatC(mean_tic_ratio, format = "e", digits = 2),
+      TICratiosd = formatC(sd_tic_ratio, format = "e", digits = 2),
+      run_name = run_name,
+      run_date = substr(run_name, 1, 6),
+      concentration = extract_conc(sample_name)
+    )
+
+  noM0_run_summary_table_col_names <- c(
+    "Sample<br>Name", "n",
+    "TIC<br>Mean", "TIC<br>SD",
+    "TICdiff", "TICdiffsd",
+    "TICratio", "TICratiosd",
+    "&#948;18O34S<br>Mean<br>(&#8240;)", "&#948;18O34S<br>SD"
+  )
+
+  noM0_run_summary_display_columns <- c(
+    "sample_name", "n",
+    "TICmean", "TICsd",
+    "TICdiff", "TICdiffsd",
+    "TICratio", "TICratiosd",
+    "d18O34S_mean", "d18O34S_sd"
+  )
+
+  noM0_caption_text <- "Summary of measured &#948;18O34S, versus the bracketing standard."
+
+  # Build HTML table as a string and emit it
+  tbl_html <- knitr::kable(
+    noM0_run_summary[, noM0_run_summary_display_columns],
+    format   = "html",
+    caption  = noM0_caption_text,
+    align    = "c",
+    col.names = noM0_run_summary_table_col_names,
+    escape   = FALSE
+  ) %>%
+    kableExtra::kable_styling(full_width = FALSE) %>%
+    kableExtra::column_spec(1, bold = TRUE)
+
+  cat(tbl_html)
+
+  cat('\n</details>\n\n')
+}
+```
+
+
+```{r combine-wM0-noM0--create-run-summary, echo=FALSE}
+
+if (noM0==FALSE){
+  run_summary <- wM0_run_summary
+} else {
+  run_summary <- full_join(
+    wM0_run_summary,
+    noM0_run_summary,
+    by = "sample_name",
+    suffix = c("_wM0", "_noM0")
+  )
+}
+
+if (noM0==FALSE){
+  run_summary <- run_summary %>%
+        mutate(d34S = d34S32S_mean,
+               d33S = d33S32S_mean,
+               d18O = d18O16O_mean,
+               d17O = d17O16O_mean)
+} else {
+  run_summary <- run_summary %>%
+        mutate(d34S = d34S32S_mean,
+               d33S = ((d33S34S_mean/1000+1)*(d34S32S_mean/1000+1)-1)*1000,
+               d18O = ((d18O34S_mean/1000+1)*(d34S32S_mean/1000+1)-1)*1000,
+               d17O = ((d17O34S_mean/1000+1)*(d34S32S_mean/1000+1)-1)*1000)
+}
+```
+
 
 ```{r Reference-Material-Data-Frames, echo=FALSE}
 # -------------------- CREATE REFERENCE MATERIAL DATA FRAMES FOR CALIBRATION --------------------
 
-get_RM_calibration_values <- function(standards, delta, run_summary, ref_mat) {
+get_RM_calibration_values <- function(standards, delta, wM0_run_summary, ref_mat) {
   # Helper to get aliases for each RM key
   get_RM_names <- function(RM_key) {
     purrr::pluck(ref_mat, "sulfates", RM_key, "names", .default = character(0))
@@ -1098,11 +1565,10 @@ get_RM_calibration_values <- function(standards, delta, run_summary, ref_mat) {
   get_RM_delta <- function(RM_key) {
     purrr::pluck(ref_mat, "sulfates", RM_key, delta, .default = NA_real_)
   }
-  # Helper to get measured mean from run_summary
+  # Helper to get measured mean from wM0_run_summary
   get_measured_mean <- function(aliases) {
-    col <- paste0(delta, "_mean")
-    if (!col %in% names(run_summary)) return(NA_real_)
-    mean(run_summary[[col]][run_summary$sample_name %in% aliases], na.rm = TRUE)
+    if (!delta %in% names(run_summary)) return(NA_real_)
+    mean(run_summary[[delta]][run_summary$sample_name %in% aliases], na.rm = TRUE)
   }
   
   tibble(name = standards) %>%
@@ -1114,148 +1580,236 @@ get_RM_calibration_values <- function(standards, delta, run_summary, ref_mat) {
     select(name, meas_vs_M0, accepted)
 }
 
+
 RM_17O <- get_RM_calibration_values(d17O_CALIBRATION_STANDARDS, "d17O", run_summary, ref_mat) %>% dplyr::rename(VSMOW = accepted)
 RM_18O <- get_RM_calibration_values(d18O_CALIBRATION_STANDARDS, "d18O", run_summary, ref_mat) %>% dplyr::rename(VSMOW = accepted)
 RM_33S <- get_RM_calibration_values(d33S_CALIBRATION_STANDARDS, "d33S", run_summary, ref_mat) %>% dplyr::rename(VCDT = accepted)
 RM_34S <- get_RM_calibration_values(d34S_CALIBRATION_STANDARDS, "d34S", run_summary, ref_mat) %>% dplyr::rename(VCDT = accepted)
 ```
 
+
+```{r Calibration-precheck, echo=FALSE, results='asis'}
+
+
+calibration_ok <- TRUE
+
+rm_check <- function(RM_dataframe) {
+  # count usable points for lm()
+  ok <- is.finite(RM_dataframe$meas_vs_M0) & is.finite(RM_dataframe[[3]])
+  usable <- sum(ok, na.rm = TRUE)
+
+  # Identify which standards are missing measured values
+  missing_meas <- RM_dataframe$name[!is.finite(RM_dataframe$meas_vs_M0)]
+
+  list(usable = usable, missing_meas = missing_meas)
+}
+
+# check each RM table (adjust min_points if you allow 2-point cal)
+c34 <- rm_check(RM_34S)
+c33 <- rm_check(RM_33S)
+c18 <- rm_check(RM_18O)
+c17 <- rm_check(RM_17O)
+
+# Decide whether calibration can proceed
+if (c34$usable < 2 || c33$usable < 2 || c18$usable < 2 || c17$usable < 2) {
+  calibration_ok <- FALSE
+
+  cat('
+<div style="border:2px solid #b30000; padding:12px; border-radius:8px; background:#fff3f3;">
+  <h3 style="margin-top:0;">⚠️ Calibration halted: required standards not found in this run</h3>
+  <p>
+    One or more calibration tables has <b>zero usable measured values</b> (meas_vs_M0 is NA/NaN),
+    usually because the expected standards were not included (or were named differently) in this run.
+  </p>
+  <p><b>Fix:</b> update the calibration standard lists in the script (e.g., <code>d34S_CALIBRATION_STANDARDS</code>, etc.)
+     to match the standards present in <code>run_summary$sample_name</code>, then re-render.</p>
+  <ul>
+')
+
+  show_missing <- function(label, missing_vec) {
+    if (length(missing_vec) > 0) {
+      cat("<li><b>", label, " missing measured values for:</b> ",
+          paste(missing_vec, collapse = ", "), "</li>", sep="")
+    }
+  }
+
+  show_missing("d34S", c34$missing_meas)
+  show_missing("d33S", c33$missing_meas)
+  show_missing("d18O", c18$missing_meas)
+  show_missing("d17O", c17$missing_meas)
+
+  cat('
+  </ul>
+</div>
+')
+
+  if (calibration_ok){
+    cat('<details><summary class="expandable_subtitles">Calibration to VCDT and VSMOW</summary>')
+  } else {
+    cat('<details><summary>Calibration to VCDT and VSMOW</summary>')
+  }
+
+}
+```
+
+
+
+
 ```{r Calibrate-to-VCDT-VSMOW, echo=FALSE}
-# -------------------- CALIBRATE d34S to VCDT and d18O to VSMOW --------------------
-# Correct to VCDT by doing a three-point calibration, which is a linear regression of the three accepted values relative to their measured ratios
-# NOTE: Jongebloed et al. (2023a GRL; 2023b, ERL) used a 4-point calibration. This was made possible by aggregating data over many Shrek runs. If the orbitrap uncalibrated deltas change day-to-day, this might not be possible
+if (calibration_ok){
+  # -------------------- CALIBRATE d34S to VCDT and d18O to VSMOW --------------------
+  # Correct to VCDT by doing a three-point calibration, which is a linear regression of the three accepted values relative to their measured ratios
+  # NOTE: Jongebloed et al. (2023a GRL; 2023b, ERL) used a 4-point calibration. This was made possible by aggregating data over many Shrek runs. If the orbitrap uncalibrated deltas change day-to-day, this might not be possible
 
-model_34S <- lm(VCDT ~ meas_vs_M0, data = RM_34S)
-slope_34S <- coef(model_34S)[2]
-intercept_34S <- coef(model_34S)[1]
-run_summary$d34S_VCDT <- slope_34S*run_summary$d34S_mean + intercept_34S
+  check_lm_data <- function(df, y, x, name) {
+    if (!is.data.frame(df)) stop(name, " is not a data.frame/tibble")
+    if (!all(c(y, x) %in% names(df))) stop(name, " missing columns: ", y, ", ", x)
 
-model_33S <- lm(VCDT ~ meas_vs_M0, data = RM_33S)
-slope_33S <- coef(model_33S)[2]
-intercept_33S <- coef(model_33S)[1]
-run_summary$d33S_VCDT <- slope_33S*run_summary$d33S_mean + intercept_33S
+    ok <- stats::complete.cases(df[, c(y, x)])
+    message(name, ": nrow=", nrow(df),
+            "  usable=", sum(ok),
+            "  yNA=", sum(is.na(df[[y]])),
+            "  xNA=", sum(is.na(df[[x]])),
+            "  yClass=", paste(class(df[[y]]), collapse=","),
+            "  xClass=", paste(class(df[[x]]), collapse=","))
+    if (sum(ok) == 0) stop(name, " has 0 usable (non-NA) rows for lm(", y, " ~ ", x, ")")
+  }
 
-model_18O <- lm(VSMOW ~ meas_vs_M0, data = RM_18O)
-slope_18O <- coef(model_18O)[2]
-intercept_18O <- coef(model_18O)[1]
-run_summary$d18O_VSMOW <- slope_18O*run_summary$d18O_mean + intercept_18O
+  check_lm_data(RM_34S, "VCDT",  "meas_vs_M0", "RM_34S")
+  check_lm_data(RM_33S, "VCDT",  "meas_vs_M0", "RM_33S")
+  check_lm_data(RM_18O, "VSMOW", "meas_vs_M0", "RM_18O")
+  check_lm_data(RM_17O, "VSMOW", "meas_vs_M0", "RM_17O")
 
-model_17O <- lm(VSMOW ~ meas_vs_M0, data = RM_17O)
-slope_17O <- coef(model_17O)[2]
-intercept_17O <- coef(model_17O)[1]
-run_summary$d17O_VSMOW <- slope_17O*run_summary$d17O_mean + intercept_17O
+  model_34S <- lm(VCDT ~ meas_vs_M0, data = RM_34S)
+  slope_34S <- coef(model_34S)[2]
+  intercept_34S <- coef(model_34S)[1]
+  run_summary$d34S_VCDT <- slope_34S*run_summary$d34S + intercept_34S
 
-aliases_table <- tibble(
-  key = sodium_sulfate_keys,
-  alias = map(key, ~ pluck(ref_mat, "sulfates", .x, "names", .default = character(0))),
-  d34Sacc = map_dbl(key, ~ pluck(ref_mat, "sulfates", .x, "d34S", .default = NA_real_)),
-  d33Sacc = map_dbl(key, ~ pluck(ref_mat, "sulfates", .x, "d33S", .default = NA_real_)),
-  d18Oacc = map_dbl(key, ~ pluck(ref_mat, "sulfates", .x, "d18O", .default = NA_real_)),
-  d17Oacc = map_dbl(key, ~ pluck(ref_mat, "sulfates", .x, "d17O", .default = NA_real_))
-) %>%
-  unnest_longer(alias)
+  model_33S <- lm(VCDT ~ meas_vs_M0, data = RM_33S)
+  slope_33S <- coef(model_33S)[2]
+  intercept_33S <- coef(model_33S)[1]
+  run_summary$d33S_VCDT <- slope_33S*run_summary$d33S + intercept_33S
 
-run_summary <- run_summary %>%
-  left_join(
-    aliases_table %>% select(alias, d34Sacc, d33Sacc, d18Oacc, d17Oacc),
-    by = c("sample_name" = "alias")
+  model_18O <- lm(VSMOW ~ meas_vs_M0, data = RM_18O)
+  slope_18O <- coef(model_18O)[2]
+  intercept_18O <- coef(model_18O)[1]
+  run_summary$d18O_VSMOW <- slope_18O*run_summary$d18O + intercept_18O
+
+  model_17O <- lm(VSMOW ~ meas_vs_M0, data = RM_17O)
+  slope_17O <- coef(model_17O)[2]
+  intercept_17O <- coef(model_17O)[1]
+  run_summary$d17O_VSMOW <- slope_17O*run_summary$d17O + intercept_17O
+
+  run_summary$D17O_VSMOW <- run_summary$d17O_VSMOW - 0.52 * run_summary$d18O_VSMOW
+
+  aliases_table <- tibble(
+    key = sodium_sulfate_keys,
+    alias = map(key, ~ pluck(ref_mat, "sulfates", .x, "names", .default = character(0))),
+    d34Sacc = map_dbl(key, ~ pluck(ref_mat, "sulfates", .x, "d34S", .default = NA_real_)),
+    d33Sacc = map_dbl(key, ~ pluck(ref_mat, "sulfates", .x, "d33S", .default = NA_real_)),
+    d18Oacc = map_dbl(key, ~ pluck(ref_mat, "sulfates", .x, "d18O", .default = NA_real_)),
+    d17Oacc = map_dbl(key, ~ pluck(ref_mat, "sulfates", .x, "d17O", .default = NA_real_))
+  ) %>%
+    unnest_longer(alias)
+
+  run_summary <- run_summary %>%
+    left_join(
+      aliases_table %>% select(alias, d34Sacc, d33Sacc, d18Oacc, d17Oacc),
+      by = c("sample_name" = "alias")
+    )
+
+  # go back and calibrate individual analyses so we can estimate errors
+  wM0_analyses$d33S_VCDT <- slope_33S*wM0_analyses$d33S32S+intercept_33S
+  wM0_analyses$d34S_VCDT <- slope_34S*wM0_analyses$d34S32S+intercept_34S
+  wM0_analyses$d17O_VSMOW <- slope_17O*wM0_analyses$d17O16O+intercept_17O
+  wM0_analyses$d18O_VSMOW <- slope_18O*wM0_analyses$d18O16O+intercept_18O
+
+  run_summary_errors <- wM0_analyses %>%
+    group_by(sample_name) %>%
+    summarise(
+      n = sum(!is.na(d34S_VCDT)),
+      d33S_sd_val = sd(d33S_VCDT, na.rm=TRUE),
+      d33S_VCDT_95CI = 1.96 * d33S_sd_val / sqrt(n),
+      d34S_sd_val = sd(d34S_VCDT, na.rm=TRUE),
+      d34S_VCDT_95CI = 1.96 * d34S_sd_val / sqrt(n),
+      d17O_sd_val = sd(d17O_VSMOW, na.rm=TRUE),
+      d17O_VSMOW_95CI = 1.96 * d17O_sd_val / sqrt(n),
+      d18O_sd_val = sd(d18O_VSMOW, na.rm=TRUE),
+      d18O_VSMOW_95CI = 1.96 * d18O_sd_val / sqrt(n),
+      .groups = "drop"
   )
 
-# go back and calibrate individual analyses so we can estimate errors
-analyses$d33S_VCDT <- slope_33S*analyses$d33S+intercept_33S
-analyses$d34S_VCDT <- slope_34S*analyses$d34S+intercept_34S
-analyses$d17O_VSMOW <- slope_17O*analyses$d17O+intercept_17O
-analyses$d18O_VSMOW <- slope_18O*analyses$d18O+intercept_18O
-
-run_summary_errors <- analyses %>%
-  group_by(sample_name) %>%
-  summarise(
-    n = sum(!is.na(d34S_VCDT)),
-    d33S_sd_val = sd(d33S_VCDT, na.rm=TRUE),
-    d33S_VCDT_95CI = 1.96 * d33S_sd_val / sqrt(n),
-    d34S_sd_val = sd(d34S_VCDT, na.rm=TRUE),
-    d34S_VCDT_95CI = 1.96 * d34S_sd_val / sqrt(n),
-    d17O_sd_val = sd(d17O_VSMOW, na.rm=TRUE),
-    d17O_VSMOW_95CI = 1.96 * d17O_sd_val / sqrt(n),
-    d18O_sd_val = sd(d18O_VSMOW, na.rm=TRUE),
-    d18O_VSMOW_95CI = 1.96 * d18O_sd_val / sqrt(n),
-    .groups = "drop"
-)
-
-# add newly calculated errors to summary data frame
-run_summary <- run_summary %>%
-  left_join(
-    run_summary_errors %>%
-      select(sample_name, d33S_VCDT_95CI, d34S_VCDT_95CI, d17O_VSMOW_95CI, d18O_VSMOW_95CI),
-    by = "sample_name"
-  )
+  # add newly calculated errors to summary data frame
+  run_summary <- run_summary %>%
+    left_join(
+      run_summary_errors %>%
+        select(sample_name, d33S_VCDT_95CI, d34S_VCDT_95CI, d17O_VSMOW_95CI, d18O_VSMOW_95CI),
+      by = "sample_name"
+    )
+}
 ```
 
 ```{r export-analyses-data, echo=FALSE, include=FALSE}
-write.csv(analyses, paste0(DATA_DIRECTORY,"/", RUN_DIRECTORY,"/",RUN_DIRECTORY,"__analyses_export.csv"), row.names = FALSE)
+write.csv(wM0_analyses, paste0(DATA_DIRECTORY,"/", run_name,"/",run_name,"__analyses_export.csv"), row.names = FALSE)
 ```
 
 ```{r export-run-summary, echo=FALSE, include=FALSE}
-
 run_summary[] <- lapply(run_summary, function(x) {
   tmp <- suppressWarnings(as.numeric(x))
   if (sum(!is.na(tmp)) >= sum(!is.na(x)) / 2) tmp else x
 })
-
-run_summary_column_order <- c("run_name", "run_date", "sample_name", "n", "concentration",
-                              "TICmean", "TICsd", "TICdiff", "TICdiffsd", "TICratio", "TICratiosd",
-                              "d33S_mean", "d33S_sd", "d33S_VCDT", "d33S_VCDT_95CI", "d33Sacc",
-                              "d34S_mean", "d34S_sd", "d34S_VCDT", "d34S_VCDT_95CI", "d34Sacc",
-                              "d17O_mean", "d17O_sd", "d17O_VSMOW", "d17O_VSMOW_95CI", "d17Oacc",
-                              "d18O_mean", "d18O_sd", "d18O_VSMOW", "d18O_VSMOW_95CI", "d18Oacc")
-run_summary <- run_summary[run_summary_column_order]
-write.csv(run_summary, paste0(DATA_DIRECTORY,"/", RUN_DIRECTORY,"/",RUN_DIRECTORY,"__run_summary.csv"), row.names = FALSE)
+write.csv(run_summary, paste0(DATA_DIRECTORY,"/", run_name,"/",run_name,"__run_summary.csv"), row.names = FALSE)
 ```
 
-```{r Samples-Summary-Table, echo=FALSE}
-samples_summary <- run_summary %>%
-  mutate(
-    sample_name = sample_name,
-    n = n,
+```{r Samples-Summary-Table, echo=FALSE, message=FALSE, warning=FALSE}
+if (calibration_ok){
+  samples_summary <- run_summary %>%
+    mutate(
+      sample_name = sample_name,
+      n = n_wM0,
 
-    d34S_mean = round(d34S_VCDT, 1),
-    d34S_bias = round(d34S_VCDT-d34Sacc, 1),
-    d34S_95CI = round(d34S_VCDT_95CI, 2),
+      d34S_mean = round(d34S_VCDT, 1),
+      d34S_bias = round(d34S_VCDT-d34Sacc, 1),
+      d34S_95CI = round(d34S_VCDT_95CI, 2),
 
-    d33S_mean = round(d33S_VCDT, 1),
-    d33S_bias = round(d33S_VCDT-d33Sacc, 1),
-    d33S_95CI = round(d33S_VCDT_95CI, 2),
-        
-    d18O_mean = round(d18O_VSMOW, 1),
-    d18O_bias = round(d18O_VSMOW-d18Oacc, 1),
-    d18O_95CI = round(d18O_VSMOW_95CI, 2),
+      d33S_mean = round(d33S_VCDT, 1),
+      d33S_bias = round(d33S_VCDT-d33Sacc, 1),
+      d33S_95CI = round(d33S_VCDT_95CI, 2),
+          
+      d18O_mean = round(d18O_VSMOW, 1),
+      d18O_bias = round(d18O_VSMOW-d18Oacc, 1),
+      d18O_95CI = round(d18O_VSMOW_95CI, 2),
 
-    d17O_mean = round(d17O_VSMOW, 1),
-    d17O_bias = round(d17O_VSMOW-d17Oacc, 1),
-    d17O_95CI = round(d17O_VSMOW_95CI, 2)
-  ) %>%
-  
-  select(sample_name, n, d34S_mean, d34S_95CI, d34S_bias, d18O_mean, d18O_95CI, d18O_bias, d33S_mean, d33S_95CI, d33S_bias, d17O_mean, d17O_95CI, d17O_bias)
+      d17O_mean = round(d17O_VSMOW, 1),
+      d17O_bias = round(d17O_VSMOW-d17Oacc, 1),
+      d17O_95CI = round(d17O_VSMOW_95CI, 2),
 
-samples_summary_table_col_names <- c("Sample<br>Name", "n",
-               "&#948;<sup>34</sup>S<br>Mean<br>VCDT<br>(&#8240;)",
-               "&#948;<sup>34</sup>S<br>95%<br>CI",
-               "&#948;<sup>34</sup>S<br>bias", 
-               "&#948;<sup>18</sup>O<br>Mean<br>VSMOW<br>(&#8240;)",
-               "&#948;<sup>18</sup>O<br>95%<br>CI",
-               "&#948;<sup>18</sup>O<br>bias",
-               "&#948;<sup>33</sup>S<br>Mean<br>VCDT<br>(&#8240;)",
-               "&#948;<sup>33</sup>S<br>95%<br>CI",
-               "&#948;<sup>33</sup>S<br>bias",
-               "&#948;<sup>17</sup>O<br>Mean<br>VSMOW<br>(&#8240;)",
-               "&#948;<sup>17</sup>O<br>95%<br>CI",
-               "&#948;<sup>17</sup>O<br>bias")
+      D17O_mean = round(D17O_VSMOW, 1)
+    ) %>%
+    
+    select(sample_name, n, d34S_mean, d34S_95CI, d34S_bias, d18O_mean, d18O_95CI, d18O_bias, d33S_mean, d33S_95CI, d33S_bias, d17O_mean, d17O_95CI, d17O_bias, D17O_mean)
 
-caption_text <- paste("Summary of calibrated &#948;<sup>34</sup>S, &#948;<sup>18</sup>O, &#948;<sup>33</sup>S and &#948;<sup>17</sup>O.")
+  samples_summary_table_col_names <- c("Sample<br>Name", "n",
+                 "&#948;<sup>34</sup>S<br>Mean<br>VCDT<br>(&#8240;)",
+                 "&#948;<sup>34</sup>S<br>95%<br>CI",
+                 "&#948;<sup>34</sup>S<br>bias", 
+                 "&#948;<sup>18</sup>O<br>Mean<br>VSMOW<br>(&#8240;)",
+                 "&#948;<sup>18</sup>O<br>95%<br>CI",
+                 "&#948;<sup>18</sup>O<br>bias",
+                 "&#948;<sup>33</sup>S<br>Mean<br>VCDT<br>(&#8240;)",
+                 "&#948;<sup>33</sup>S<br>95%<br>CI",
+                 "&#948;<sup>33</sup>S<br>bias",
+                 "&#948;<sup>17</sup>O<br>Mean<br>VSMOW<br>(&#8240;)",
+                 "&#948;<sup>17</sup>O<br>95%<br>CI",
+                 "&#948;<sup>17</sup>O<br>bias",
+                 "&#916;<sup>17</sup>O<br>Mean<br>VSMOW<br>(&#8240;)")
 
-knitr::kable(samples_summary, format = "html", caption = caption_text, 
-             align = "c", col.names = samples_summary_table_col_names, escape = FALSE) %>%
-  column_spec(1, bold = TRUE)  # Makes the first column bold
+  caption_text <- paste("Summary of calibrated &#948;<sup>34</sup>S, &#948;<sup>18</sup>O, &#948;<sup>33</sup>S, &#948;<sup>17</sup>O, and &#916;<sup>17</sup>O.")
+
+  knitr::kable(samples_summary, format = "html", caption = caption_text, 
+               align = "c", col.names = samples_summary_table_col_names, escape = FALSE) %>%
+    column_spec(1, bold = TRUE)  # Makes the first column bold
+}
 ```
 
 </details>
@@ -1264,240 +1818,240 @@ knitr::kable(samples_summary, format = "html", caption = caption_text,
 
 These figures are intended to provide a sense of sample spread.
 
-```{r replicate-assessment, echo=FALSE, fig.width=10, fig.height=6}
+```{r replicate-assessment, echo=FALSE, message=FALSE, warning=FALSE, fig.width=10, fig.height=6}
+if (calibration_ok){
+  # All sample names present in this run (with non-NA d34S_VCDT)
+  sample_levels <- wM0_analyses %>%
+    filter(!is.na(d34S_VCDT)) %>%
+    arrange(sample_name, sample_order) %>%
+    pull(sample_name) %>%
+    unique()
 
-# All sample names present in this run (with non-NA d34S_VCDT)
-sample_levels <- analyses %>%
-  filter(!is.na(d34S_VCDT)) %>%
-  arrange(sample_name, sample_order) %>%
-  pull(sample_name) %>%
-  unique()
-
-# Filter your main dataframe to remove NAs
-samples_df_noNA <- analyses %>%
-  filter(!is.na(d34S_VCDT)) %>%
-  mutate(
-    sample_name = factor(sample_name, levels = sample_levels)
-  )
-
-# Order and position samples
-samples_df_order <- samples_df_noNA %>%
-  arrange(sample_name, sample_order) %>%
-  mutate(
-    x_pos = as.numeric(sample_name) +
-      (sample_order - min(sample_order)) * 0.010
-  )
-
-# Compute shading width from actual sample extents
-shading_extents <- samples_df_order %>%
-  group_by(sample_name) %>%
-  summarise(
-    x_min = min(x_pos) - 0.05,
-    x_max = max(x_pos) + 0.05,
-    .groups = "drop"
-  )
-
-# Prepare shading values from scratch
-shading_values <- tibble(sample_name = sample_levels) %>%
-  mutate(
-    shade_y = purrr::map_dbl(
-      sample_name,
-      ~ purrr::pluck(ref_mat, "sulfates", .x, "d34S", .default = NA_real_)
+  # Filter your main dataframe to remove NAs
+  samples_df_noNA <- wM0_analyses %>%
+    filter(!is.na(d34S_VCDT)) %>%
+    mutate(
+      sample_name = factor(sample_name, levels = sample_levels)
     )
-  ) %>%
-  left_join(shading_extents, by = "sample_name") %>%
-  mutate(
-    y_min = shade_y - 0.8,
-    y_max = shade_y + 0.8
-  ) %>%
-  filter(!is.na(shade_y))
+
+  # Order and position samples
+  samples_df_order <- samples_df_noNA %>%
+    arrange(sample_name, sample_order) %>%
+    mutate(
+      x_pos = as.numeric(sample_name) +
+        (sample_order - min(sample_order)) * 0.010
+    )
+
+  # Compute shading width from actual sample extents
+  shading_extents <- samples_df_order %>%
+    group_by(sample_name) %>%
+    summarise(
+      x_min = min(x_pos) - 0.05,
+      x_max = max(x_pos) + 0.05,
+      .groups = "drop"
+    )
+
+  # Prepare shading values from scratch
+  shading_values <- tibble(sample_name = sample_levels) %>%
+    mutate(
+      shade_y = purrr::map_dbl(
+        sample_name,
+        ~ purrr::pluck(ref_mat, "sulfates", .x, "d34S", .default = NA_real_)
+      )
+    ) %>%
+    left_join(shading_extents, by = "sample_name") %>%
+    mutate(
+      y_min = shade_y - 0.8,
+      y_max = shade_y + 0.8
+    ) %>%
+    filter(!is.na(shade_y))
 
 
-Fig_delta34S_vs_order <- ggplot() + 
-  geom_point(data = samples_df_order,
-             aes(x = x_pos, y = d34S_VCDT,  shape=sample_name, fill=sample_name), size=6) +
-  geom_label_order(samples_df_order, aes(x = x_pos, y = d34S_VCDT, label = sample_order)) +
-  scale_color_manual(values=color_values) +
-  scale_shape_manual(values=shape_values) +
-  scale_fill_manual(values=color_values) +
-  geom_rect(data = shading_values,
-            aes(xmin = x_min, xmax = x_max, ymin = y_min, ymax = y_max),
-            fill = "gray80", alpha = 0.5, inherit.aes = FALSE) +
-  scale_x_continuous(breaks = NULL) +
-  labs(x = "Sample Type", y = expression(delta^34*"S (VCDT)"), color = "Sample Name")
-print(Fig_delta34S_vs_order)
-
-
-run_summary_concentration <- run_summary[!is.na(run_summary$concentration), ]
-if (nrow(run_summary_concentration)>0){
-  Fig_d34S_vs_TIC <- ggplot(run_summary_concentration) +
-    geom_point(aes(x=TICmean, y=d34S_VCDT,  shape=sample_name, fill=sample_name), size=6) +
+  Fig_delta34S_vs_order <- ggplot() + 
+    geom_point(data = samples_df_order,
+               aes(x = x_pos, y = d34S_VCDT,  shape=sample_name, fill=sample_name), size=6) +
+    geom_label_order(samples_df_order, aes(x = x_pos, y = d34S_VCDT, label = sample_order)) +
     scale_color_manual(values=color_values) +
     scale_shape_manual(values=shape_values) +
     scale_fill_manual(values=color_values) +
-    geom_errorbar(aes(ymin = d34S_VCDT - d34S_VCDT_95CI,
-                    ymax = d34S_VCDT + d34S_VCDT_95CI),
-                width = 0.2,
-                linewidth = 0.8) +
-    geom_label_order(run_summary_concentration, aes(x = TICmean, y = d34S_VCDT, label = sample_order)) +
-    labs(x = "TIC", y = expression(delta^34*"S (VCDT)"), color = "Sample Name")
-  print(Fig_d34S_vs_TIC)
+    geom_rect(data = shading_values,
+              aes(xmin = x_min, xmax = x_max, ymin = y_min, ymax = y_max),
+              fill = "gray80", alpha = 0.5, inherit.aes = FALSE) +
+    scale_x_continuous(breaks = NULL) +
+    labs(x = "Sample Type", y = expression(delta^34*"S (VCDT)"), color = "Sample Name")
+  print(Fig_delta34S_vs_order)
 
 
-  Fig_d34S_vs_TICratio <- ggplot(run_summary_concentration) +
-    geom_point(aes(x=TICratio, y=d34S_VCDT, color=sample_name), size = 5) +
-    geom_errorbar(aes(ymin = d34S_VCDT - d34S_VCDT_95CI, ymax = d34S_VCDT + d34S_VCDT_95CI),
-                      width = 0.2,
-                      linewidth = 0.8) +
-    geom_label_order(run_summary_concentration, aes(x = TICratio, y = d34S_VCDT, label = sample_order)) +
-    labs(x = "TICratio", y = expression(delta^34*"S (VCDT)"), color = "Sample Name")
-  print(Fig_d34S_vs_TICratio)
+  run_summary_concentration <- run_summary[!is.na(run_summary$concentration_wM0), ]
+  if (nrow(run_summary_concentration)>0){
+    Fig_d34S_vs_TIC <- ggplot(run_summary_concentration) +
+      geom_point(aes(x=TICmean, y=d34S_VCDT,  shape=sample_name, fill=sample_name), size=6) +
+      scale_color_manual(values=color_values) +
+      scale_shape_manual(values=shape_values) +
+      scale_fill_manual(values=color_values) +
+      geom_errorbar(aes(ymin = d34S_VCDT - d34S_VCDT_95CI,
+                      ymax = d34S_VCDT + d34S_VCDT_95CI),
+                  width = 0.2,
+                  linewidth = 0.8) +
+      geom_label_order(run_summary_concentration, aes(x = TICmean, y = d34S_VCDT, label = sample_order)) +
+      labs(x = "TIC", y = expression(delta^34*"S (VCDT)"), color = "Sample Name")
+    print(Fig_d34S_vs_TIC)
 
 
-  Fig_d34S_vs_concentration <- ggplot(run_summary_concentration) + 
-    geom_point(aes(x=concentration, y=d34S_VCDT, color=sample_name), size = 5) +
-    geom_errorbar(aes(ymin = d34S_VCDT - d34S_VCDT_95CI, ymax = d34S_VCDT + d34S_VCDT_95CI),
-                      width = 0.2,
-                      linewidth = 0.8) +
-    geom_label_order(run_summary_concentration, aes(x = concentration, y = d34S_VCDT, label = sample_order)) +
-    labs(x = "Sample Concentration (uM)", y = expression(delta^34*"S (VCDT)"), color = "Sample Name")
-  print(Fig_d34S_vs_concentration)
+    Fig_d34S_vs_TICratio <- ggplot(run_summary_concentration) +
+      geom_point(aes(x=TICratio, y=d34S_VCDT, color=sample_name), size = 5) +
+      geom_errorbar(aes(ymin = d34S_VCDT - d34S_VCDT_95CI, ymax = d34S_VCDT + d34S_VCDT_95CI),
+                        width = 0.2,
+                        linewidth = 0.8) +
+      geom_label_order(run_summary_concentration, aes(x = TICratio, y = d34S_VCDT, label = sample_order)) +
+      labs(x = "TICratio", y = expression(delta^34*"S (VCDT)"), color = "Sample Name")
+    print(Fig_d34S_vs_TICratio)
 
 
-  Fig_tic_vs_concentration <- ggplot(run_summary_concentration) +
-    geom_point(aes(x=concentration, y=TICmean, color=sample_name), size = 5) +
-    geom_errorbar(aes(ymin = TICmean - TICsd, ymax = TICmean + TICsd),
-                      width = 0.2,
-                      linewidth = 0.8) +
-    geom_label_order(run_summary_concentration, aes(x = concentration, y = TICmean, label = sample_order)) +
-    labs(x = "Sample Concentration (uM)", y = "TIC", color = "Sample Name")
-  print(Fig_tic_vs_concentration)
+    Fig_d34S_vs_concentration <- ggplot(run_summary_concentration) + 
+      geom_point(aes(x=concentration, y=d34S_VCDT, color=sample_name), size = 5) +
+      geom_errorbar(aes(ymin = d34S_VCDT - d34S_VCDT_95CI, ymax = d34S_VCDT + d34S_VCDT_95CI),
+                        width = 0.2,
+                        linewidth = 0.8) +
+      geom_label_order(run_summary_concentration, aes(x = concentration, y = d34S_VCDT, label = sample_order)) +
+      labs(x = "Sample Concentration (uM)", y = expression(delta^34*"S (VCDT)"), color = "Sample Name")
+    print(Fig_d34S_vs_concentration)
 
-} else {
-  print('No concentration range analyses')
+
+    Fig_tic_vs_concentration <- ggplot(run_summary_concentration) +
+      geom_point(aes(x=concentration, y=TICmean, color=sample_name), size = 5) +
+      geom_errorbar(aes(ymin = TICmean - TICsd, ymax = TICmean + TICsd),
+                        width = 0.2,
+                        linewidth = 0.8) +
+      geom_label_order(run_summary_concentration, aes(x = concentration, y = TICmean, label = sample_order)) +
+      labs(x = "Sample Concentration (uM)", y = "TIC", color = "Sample Name")
+    print(Fig_tic_vs_concentration)
+
+  } else {
+    print('No concentration range analyses')
+  }
+  write.csv(wM0_analyses, file = paste0(run_name,"__raw_byInjection.csv"), row.names = FALSE)
+
+  write.csv(bracketing_references, file = paste0(run_name,"__bracketing.csv"), row.names = FALSE)
 }
-write.csv(analyses, file = paste0(RUN_DIRECTORY,"__raw_byInjection.csv"), row.names = FALSE)
-
-write.csv(bracketing_references, file = paste0(RUN_DIRECTORY,"__bracketing.csv"), row.names = FALSE)
-
 ```
 
-```{r residual-figures, echo=FALSE, fig.width=10, fig.height=6}
+```{r residual-figures, echo=FALSE, warning=FALSE, fig.width=10, fig.height=6}
+if (calibration_ok){
+  # Calculate the residual (departure from mean) for all replicated analyses and across all deltas.
+  residuals <- wM0_analyses %>%
+    group_by(sample_name) %>%
+    mutate(across(c(d34S32S, d18O16O, d17O16O, d33S32S), ~ . - mean(. , na.rm = TRUE), .names = "{.col}_residual")) %>%
+    ungroup()
 
-# Calculate the residual (departure from mean) for all replicated analyses and across all deltas.
-residuals <- analyses %>%
-  group_by(sample_name) %>%
-  mutate(across(c(d34S, d18O, d17O, d33S), ~ . - mean(. , na.rm = TRUE), .names = "{.col}_residual")) %>%
-  ungroup()
-
-d34S_precision <- round(sd(residuals$d34S_residual, na.rm = TRUE) * 2, 2)
-d18O_precision <- round(sd(residuals$d18O_residual, na.rm = TRUE) * 2, 2)
-d34S_outlier <- round(sd(residuals$d34S_residual, na.rm = TRUE) * 3.3, 2)
-d18O_outlier <- round(sd(residuals$d18O_residual, na.rm = TRUE) * 3.3, 2)
-
-
-d34S_title <- paste0("d34S residual 2-sigma = ", d34S_precision, " permil; (yellow = 95%; red = 99.9%)")
-Fig_d34Sresidual_vs_order <- ggplot(residuals) + 
-      geom_point(aes(x=sample_order, y=d34S_residual, shape=sample_name, fill=sample_name), size=6) +
-      geom_hline(yintercept = d34S_precision,   linetype = "solid", color = "yellow",   linewidth = 0.5) +
-      geom_hline(yintercept = -d34S_precision,   linetype = "solid", color = "yellow",   linewidth = 0.5) +
-      geom_hline(yintercept = d34S_outlier,   linetype = "solid", color = "red",   linewidth = 0.5) +
-      geom_hline(yintercept = -d34S_outlier,   linetype = "solid", color = "red",   linewidth = 0.5) +
-      scale_color_manual(values=color_values) +
-      scale_shape_manual(values=shape_values) +
-      scale_fill_manual(values=color_values) +
-      geom_label_order(residuals, aes(x = sample_order, y = d34S_residual, label = sample_order)) +
-      labs(title = d34S_title, x = "Sample Order", y = "d34S residual (permil)", color = "Sample Name")
-print(Fig_d34Sresidual_vs_order)
-
-# Ensure sample_name is a factor
-residuals$sample_name <- factor(residuals$sample_name)
-
-# Compute mean ± SD for each sample
-sd_data <- residuals %>%
-  group_by(sample_name) %>%
-  summarise(
-    mean_residual = mean(d34S_residual, na.rm = TRUE),
-    sd_residual   = sd(d34S_residual, na.rm = TRUE),
-    .groups = "drop"
-  ) %>%
-  mutate(
-    ymin = mean_residual - sd_residual*2,
-    ymax = mean_residual + sd_residual*2
-  )
-
-# Merge SD info into main data + flag outliers
-residuals_flagged <- residuals %>%
-  left_join(sd_data, by = "sample_name") %>%
-  mutate(
-    outside_sd = d34S_residual < ymin | d34S_residual > ymax,
-    label_font = ifelse(outside_sd, "bold", "plain")
-  )
-
-Fig_d34Sresidual_vs_name <- ggplot() +
-  
-  # ---- SD shaded region ----
-  geom_rect(
-    data = sd_data,
-    aes(
-      xmin = as.numeric(sample_name) - 0.45,
-      xmax = as.numeric(sample_name) + 0.45,
-      ymin = ymin,
-      ymax = ymax,
-      fill = sample_name
-    ),
-    alpha = 0.25,
-    show.legend = FALSE
-  ) +
-  
-  # ---- Points ----
-  geom_point(data = residuals_flagged,
-             aes(x = sample_name, y = d34S_residual, shape=sample_name, fill=sample_name), size=6) +
-  geom_hline(yintercept = d34S_precision,   linetype = "solid", color = "yellow",   linewidth = 0.5) +
-  geom_hline(yintercept = -d34S_precision,   linetype = "solid", color = "yellow",   linewidth = 0.5) +
-  geom_hline(yintercept = d34S_outlier,   linetype = "solid", color = "red",   linewidth = 0.5) +
-  geom_hline(yintercept = -d34S_outlier,   linetype = "solid", color = "red",   linewidth = 0.5) +
-  scale_color_manual(values=color_values) +
-  scale_shape_manual(values=shape_values) +
-  scale_fill_manual(values=color_values) +
-  geom_label_order(residuals_flagged, aes(x = sample_name, y = d34S_residual, label = sample_order)) +
-
-  labs(
-    title = "2-Sigma range highlighted",
-    x = "Sample Name",
-    y = "d34S residual (permil)",
-    color = "Sample Name"
-  )
-print(Fig_d34Sresidual_vs_name)
+  d34S32S_precision <- round(sd(residuals$d34S32S_residual, na.rm = TRUE) * 2, 2)
+  d18O16O_precision <- round(sd(residuals$d18O16O_residual, na.rm = TRUE) * 2, 2)
+  d34S32S_outlier <- round(sd(residuals$d34S32S_residual, na.rm = TRUE) * 3.3, 2)
+  d18O16O_outlier <- round(sd(residuals$d18O16O_residual, na.rm = TRUE) * 3.3, 2)
 
 
+  d34S32S_title <- paste0("d34S residual 2-sigma = ", d34S32S_precision, " permil; (yellow = 95%; red = 99.9%)")
+  Fig_d34Sresidual_vs_order <- ggplot(residuals) + 
+        geom_point(aes(x=sample_order, y=d34S32S_residual, shape=sample_name, fill=sample_name), size=6) +
+        geom_hline(yintercept = d34S32S_precision,   linetype = "solid", color = "yellow",   linewidth = 0.5) +
+        geom_hline(yintercept = -d34S32S_precision,   linetype = "solid", color = "yellow",   linewidth = 0.5) +
+        geom_hline(yintercept = d34S32S_outlier,   linetype = "solid", color = "red",   linewidth = 0.5) +
+        geom_hline(yintercept = -d34S32S_outlier,   linetype = "solid", color = "red",   linewidth = 0.5) +
+        scale_color_manual(values=color_values) +
+        scale_shape_manual(values=shape_values) +
+        scale_fill_manual(values=color_values) +
+        geom_label_order(residuals, aes(x = sample_order, y = d34S32S_residual, label = sample_order)) +
+        labs(title = d34S32S_title, x = "Sample Order", y = "d34S residual (permil)", color = "Sample Name")
+  print(Fig_d34Sresidual_vs_order)
 
-# Fig_d34Sresidual_vs_TIC <- ggplot() + 
-#       geom_point(data=residuals, mapping=aes(x=TICmean, y=d34S_residual, shape=sample_name, fill=sample_name), size=6) +
-#       scale_color_manual(values=color_values) +
-#       scale_shape_manual(values=shape_values) +
-#       scale_fill_manual(values=color_values) +
-#       geom_label_order(residuals, aes(x = TICmean, y = d34S_residual, label = sample_order)) +
-#       labs(title = d34S_title, x = "Mean TIC", y = "d34S residual (permil)", color = "Sample Name")
-# print(Fig_d34Sresidual_vs_TIC)
+  # Ensure sample_name is a factor
+  residuals$sample_name <- factor(residuals$sample_name)
+
+  # Compute mean ± SD for each sample
+  sd_data <- residuals %>%
+    group_by(sample_name) %>%
+    summarise(
+      mean_residual = mean(d34S32S_residual, na.rm = TRUE),
+      sd_residual   = sd(d34S32S_residual, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      ymin = mean_residual - sd_residual*2,
+      ymax = mean_residual + sd_residual*2
+    )
+
+  # Merge SD info into main data + flag outliers
+  residuals_flagged <- residuals %>%
+    left_join(sd_data, by = "sample_name") %>%
+    mutate(
+      outside_sd = d34S32S_residual < ymin | d34S32S_residual > ymax,
+      label_font = ifelse(outside_sd, "bold", "plain")
+    )
+
+  Fig_d34Sresidual_vs_name <- ggplot() +
+    
+    # ---- SD shaded region ----
+    geom_rect(
+      data = sd_data,
+      aes(
+        xmin = as.numeric(sample_name) - 0.45,
+        xmax = as.numeric(sample_name) + 0.45,
+        ymin = ymin,
+        ymax = ymax,
+        fill = sample_name
+      ),
+      alpha = 0.25,
+      show.legend = FALSE
+    ) +
+    
+    # ---- Points ----
+    geom_point(data = residuals_flagged,
+               aes(x = sample_name, y = d34S32S_residual, shape=sample_name, fill=sample_name), size=6) +
+    geom_hline(yintercept = d34S32S_precision,   linetype = "solid", color = "yellow",   linewidth = 0.5) +
+    geom_hline(yintercept = -d34S32S_precision,   linetype = "solid", color = "yellow",   linewidth = 0.5) +
+    geom_hline(yintercept = d34S32S_outlier,   linetype = "solid", color = "red",   linewidth = 0.5) +
+    geom_hline(yintercept = -d34S32S_outlier,   linetype = "solid", color = "red",   linewidth = 0.5) +
+    scale_color_manual(values=color_values) +
+    scale_shape_manual(values=shape_values) +
+    scale_fill_manual(values=color_values) +
+    geom_label_order(residuals_flagged, aes(x = sample_name, y = d34S32S_residual, label = sample_order)) +
+
+    labs(
+      title = "2-Sigma range highlighted",
+      x = "Sample Name",
+      y = "d34S residual (permil)",
+      color = "Sample Name"
+    )
+  print(Fig_d34Sresidual_vs_name)
 
 
 
-d18O_title <- paste0("d18O residual 2-sigma = ", d18O_precision, " permil; (yellow = 95%; red = 99.9%)")
-Fig_d18Oresidual_vs_order <- ggplot() + 
-      geom_point(data=residuals, mapping=aes(x=sample_order, y=d18O_residual, shape=sample_name, fill=sample_name), size=6) +
-      geom_hline(yintercept = d18O_precision,   linetype = "solid", color = "yellow",   linewidth = 0.5) +
-      geom_hline(yintercept = -d18O_precision,   linetype = "solid", color = "yellow",   linewidth = 0.5) +
-      geom_hline(yintercept = d18O_outlier,   linetype = "solid", color = "red",   linewidth = 0.5) +
-      geom_hline(yintercept = -d18O_outlier,   linetype = "solid", color = "red",   linewidth = 0.5) +
-      scale_color_manual(values=color_values) +
-      scale_shape_manual(values=shape_values) +
-      scale_fill_manual(values=color_values) +
-      geom_label_order(residuals, aes(x = sample_order, y = d18O_residual, label = sample_order)) +
-      labs(title = d18O_title, x = "Sample Order", y = "d18O residual (permil)", color = "Sample Name")
-print(Fig_d18Oresidual_vs_order)
+  # Fig_d34Sresidual_vs_TIC <- ggplot() + 
+  #       geom_point(data=residuals, mapping=aes(x=TICmean, y=d34S32S_residual, shape=sample_name, fill=sample_name), size=6) +
+  #       scale_color_manual(values=color_values) +
+  #       scale_shape_manual(values=shape_values) +
+  #       scale_fill_manual(values=color_values) +
+  #       geom_label_order(residuals, aes(x = TICmean, y = d34S32S_residual, label = sample_order)) +
+  #       labs(title = d34S32S_title, x = "Mean TIC", y = "d34S residual (permil)", color = "Sample Name")
+  # print(Fig_d34Sresidual_vs_TIC)
 
 
+
+  d18O16O_title <- paste0("d18O residual 2-sigma = ", d18O16O_precision, " permil; (yellow = 95%; red = 99.9%)")
+  Fig_d18Oresidual_vs_order <- ggplot() + 
+        geom_point(data=residuals, mapping=aes(x=sample_order, y=d18O16O_residual, shape=sample_name, fill=sample_name), size=6) +
+        geom_hline(yintercept = d18O16O_precision,   linetype = "solid", color = "yellow",   linewidth = 0.5) +
+        geom_hline(yintercept = -d18O16O_precision,   linetype = "solid", color = "yellow",   linewidth = 0.5) +
+        geom_hline(yintercept = d18O16O_outlier,   linetype = "solid", color = "red",   linewidth = 0.5) +
+        geom_hline(yintercept = -d18O16O_outlier,   linetype = "solid", color = "red",   linewidth = 0.5) +
+        scale_color_manual(values=color_values) +
+        scale_shape_manual(values=shape_values) +
+        scale_fill_manual(values=color_values) +
+        geom_label_order(residuals, aes(x = sample_order, y = d18O16O_residual, label = sample_order)) +
+        labs(title = d18O16O_title, x = "Sample Order", y = "d18O residual (permil)", color = "Sample Name")
+  print(Fig_d18Oresidual_vs_order)
+
+}
 ```
 
 </details>
@@ -1550,7 +2104,7 @@ This package builds on the excellent ecosystem of open-source tools, especially:
 - 2024-09-16 => Saved from v240912_0918 as Becky's original filename (CalculateDeltas.R) for simplicity.
 - 2024-10-14 => Tried to update in favor of flexible sample names and unknown sample names
 - 2024-10-21 => Adding noM0 as option
-- 2025-01-09 => this version has isoorbi.uw and RUN_DIRECTORY to show figure titles as the run name
+- 2025-01-09 => this version has isoorbi.uw and run_name to show figure titles as the run name
 - 2025-01-21 => found bug in plot_tic and plot_ratio functions, they were not working with noM0; other noM0 fixes
 - 2025-01-22 => added .raw file time stamps
 - 2025-01-28 => continued refining this code as an Rmarkdown file
@@ -1566,15 +2120,17 @@ This package builds on the excellent ecosystem of open-source tools, especially:
 - 2025-09-30 => combining high-res-ivan.R with ruby.Rmd, and so far calling it ivanruby.Rmd. Here are some important notes regarding this combination:
   - ruby.Rmd used the sum method in isoorbi to calculate the ratios (orbi_summarize_results(ratio_method = "sum")). high-res-ivan.R uses dplyr summarize and mean, which, I think, should be identical to isoorbit arithmetic mean. This present code, uses the dplyr summarize mean method.
 - 2025-10-21 => now using melvin
-- 2025-11-13 => raw data support. NOT MORE ISOX. Drew's TIC ratio math as of ivanruby.Rmd in run directory 251107. Jack's manuscript peak definition can be selected. Now need to test on a variety of runs to make sure I have raw data support truly working.
-- 2025-11-18 => SAMPLES_TO_IGNORE works again, it was dead after moving to raw files; 
+- 2025-11-13 => raw data support. NO MORE ISOX. Drew's TIC ratio math as of ivanruby.Rmd in run directory 251107. Jack's manuscript peak definition can be selected. Now need to test on a variety of runs to make sure I have raw data support truly working.
+- 2025-11-18 => wM0_SAMPLES_TO_IGNORE works again, it was dead after moving to raw files; 
 - 2025-11-20 => moved analyses export to csv up next to vial level export
 - 2025-12-05 => fix bug in where csv files were being saved
 - 2025-12-25 => moved to git and github, merged Drew's version, merged Andy's version, saved as sulfate.Rmd, added this comment to practice branching, merging, and all the git things
 - 2025-12-27 => minor cleanup, standardized figures, removed old content
 - 2025-12-30 => trying to make sulfate.Rmd handle both HSO4 and SO3; the first raw file is read in and the LowMass is used to decide if we measured HSO4 or SO3; added precision and outlier horizontal lines to residual figures 
+- 2025-12-31 => removed isox relicts; trying for noM0 support again
+- 2026-01-11 => mostly done with noM0 support; still need to work out error calculation
 </details>
 
 ```{r, save-workspace, echo=FALSE, include=FALSE}
-save.image(file = file.path(DATA_DIRECTORY, RUN_DIRECTORY,"workspace.RData"))
+save.image(file = file.path(DATA_DIRECTORY, run_name,"workspace.RData"))
 ```
